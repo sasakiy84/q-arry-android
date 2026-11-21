@@ -11,6 +11,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.SQLiteMode
+import java.util.Locale
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36], application = Application::class)
@@ -117,16 +118,137 @@ class FeedStoreTest {
     }
 
     @Test
+    fun aFavoriteFeedKeepsItsArticlesAndQueueAndRemainsFavoriteAfterRefresh() {
+        assertTrue(store.queueName(null, "Research"))
+        val queue = store.load(null, false, 10).queues.single()
+        val feedId = store.subscribe(example, queue.id)
+        val otherId = store.subscribe(example.copy(url = "https://other.example/feed"), null)
+        store.setFeedFavorite(feedId, true)
+        store.recordRefresh(feedId, example.copy(title = "Updated feed", home = null))
+        store.close()
+        store = FeedStore(RuntimeEnvironment.getApplication())
+
+        val subscriptions = store.subscriptions().associateBy { it.id }
+        val favorite = subscriptions.getValue(feedId)
+        assertTrue(favorite.isFavorite)
+        assertFalse(subscriptions.getValue(otherId).isFavorite)
+        assertEquals(setOf(queue.id), favorite.queueIds)
+        assertEquals(example.home, favorite.homeUrl)
+        assertEquals("First article", store.feedArticles(feedId, 10).articles.single().title)
+
+        store.setFeedFavorite(feedId, false)
+        assertFalse(store.subscriptions().single { it.id == feedId }.isFavorite)
+    }
+
+    @Test
+    fun sortsByNameNewestArticleOrMostRecentRegistration() {
+        val older = example.copy(
+            title = "Alpha",
+            url = "https://alpha.example/feed",
+            articles = example.articles.map { it.copy(published = 500L) },
+        )
+        val newerId = store.subscribe(example.copy(title = "Zeta"), null)
+        val olderId = store.subscribe(older, null)
+        val emptyId = store.subscribe(example.copy(title = "Beta", url = "https://beta.example/feed", articles = emptyList()), null)
+
+        fun orderBy(order: FeedOrder): List<Long> = order.sort(store.subscriptions(), Locale.JAPANESE).map { it.id }
+
+        assertEquals(listOf(olderId, emptyId, newerId), orderBy(FeedOrder.Name))
+        assertEquals(listOf(newerId, olderId, emptyId), orderBy(FeedOrder.Updated))
+        assertEquals(listOf(emptyId, olderId, newerId), orderBy(FeedOrder.Registered))
+
+        store.recordRefresh(olderId, null)
+        assertEquals(listOf(newerId, olderId, emptyId), orderBy(FeedOrder.Updated))
+
+        store.recordRefresh(olderId, older.copy(articles = listOf(older.articles.single().copy(key = "undated", published = null))))
+        assertEquals(listOf(olderId, newerId, emptyId), orderBy(FeedOrder.Updated))
+    }
+
+    @Test
+    fun savingFeedbackRemovesAnArticleFromAllQueuesAndKeepsTheOriginalFeedbackAfterUnsubscribe() {
+        val feedId = store.subscribe(example, null)
+        assertTrue(store.queueName(null, "Research"))
+        assertTrue(store.queueName(null, "Daily"))
+        val queues = store.load(null, false, 10).queues
+        store.setMembership(feedId, queues.map { it.id }.toSet())
+        val original = store.load(null, false, 10).articles.single()
+        store.recordView(original.id, 10L)
+        store.dismissArticle(original.id, ArticleRating.Good)
+        store.dismissArticle(original.id, ArticleRating.Bad)
+
+        val changed = example.copy(articles = example.articles.map { it.copy(body = "Updated body") })
+        store.recordRefresh(feedId, changed)
+        assertTrue(store.load(null, false, 10).articles.isEmpty())
+        queues.forEach { queue -> assertTrue(store.load(queue.id, false, 10).articles.isEmpty()) }
+        assertTrue(store.feedArticles(feedId, 10).articles.isEmpty())
+        val viewed = store.history(10).articles.single()
+        assertEquals(original.id, viewed.id)
+        assertEquals(ArticleRating.Good, viewed.rating)
+        assertTrue(viewed.dismissed)
+
+        store.removeFeed(feedId)
+        val newFeedId = store.subscribe(changed, null)
+        assertTrue(store.feedArticles(newFeedId, 10).articles.isEmpty())
+        store.readableDatabase.rawQuery(
+            "SELECT feed_url, entry_key, article_url, title, body, rating, rated_at FROM article_feedback",
+            null,
+        ).use { rows ->
+            assertTrue(rows.moveToFirst())
+            assertEquals(example.url, rows.getString(0))
+            assertEquals(example.articles.single().key, rows.getString(1))
+            assertEquals(original.url, rows.getString(2))
+            assertEquals(original.title, rows.getString(3))
+            assertEquals(original.body, rows.getString(4))
+            assertEquals(ArticleRating.Good.value, rows.getInt(5))
+            assertTrue(rows.getLong(6) > 0)
+            assertFalse(rows.moveToNext())
+        }
+    }
+
+    @Test
+    fun viewingRecordsTheMostRecentVisitAndManualRemovalDoesNotCreateFeedback() {
+        val second = example.articles.single().copy(key = "second", title = "Second")
+        val third = second.copy(key = "third", title = "Third")
+        store.subscribe(example.copy(articles = example.articles + listOf(second, third)), null)
+        val articles = store.load(null, false, 10).articles.associateBy { it.title }
+        val firstId = articles.getValue("First article").id
+        val secondId = articles.getValue("Second").id
+        val thirdId = articles.getValue("Third").id
+        store.recordView(firstId, 10L)
+        store.recordView(secondId, 20L)
+        store.recordView(firstId, 30L)
+        store.setRead(firstId, false)
+        store.dismissArticle(firstId, null)
+        store.dismissArticle(thirdId, ArticleRating.Bad)
+
+        val recent = store.history(1)
+        assertTrue(recent.hasMore)
+        assertEquals(firstId, recent.articles.single().id)
+        assertNull(recent.articles.single().rating)
+        assertFalse(recent.articles.single().read)
+        assertEquals(listOf(firstId, secondId), store.history(10).articles.map { it.id })
+        assertEquals(listOf(secondId), store.load(null, false, 10).articles.map { it.id })
+        assertEquals(ArticleRating.Bad, store.article(thirdId)?.rating)
+    }
+
+    @Test
     fun upgradingTheOriginalDatabaseRetainsExistingRssEntriesAndQueueMemberships() {
         assertTrue(store.queueName(null, "Research"))
         val queueId = store.load(null, false, 10).queues.single().id
         store.subscribe(example, queueId)
         val articleId = store.load(queueId, false, 10).articles.single().id
         store.setRead(articleId, true)
-        // The two added columns are the only difference from the installed version 1 schema.
+        // Rebuild the original schema without the later feed and article metadata.
         store.writableDatabase.apply {
+            execSQL("DROP INDEX article_viewed")
+            execSQL("DROP INDEX article_feed_newest")
+            execSQL("DROP TABLE article_feedback")
             execSQL("ALTER TABLE feed DROP COLUMN html_item_selector")
+            execSQL("ALTER TABLE feed DROP COLUMN home_url")
+            execSQL("ALTER TABLE feed DROP COLUMN is_favorite")
             execSQL("ALTER TABLE article DROP COLUMN thumbnail_url")
+            execSQL("ALTER TABLE article DROP COLUMN viewed_at")
+            execSQL("ALTER TABLE article DROP COLUMN dismissed")
             version = 1
         }
         store.close()
@@ -138,5 +260,71 @@ class FeedStoreTest {
         assertEquals("First article", article.title)
         assertTrue(article.read)
         assertNull(article.thumbnailUrl)
+        assertFalse(article.dismissed)
+        assertTrue(store.history(10).articles.isEmpty())
+    }
+
+    @Test
+    fun upgradingVersionTwoRetainsTheWebsiteRuleAndThumbnail() {
+        val website = example.copy(
+            htmlItemSelector = "main article",
+            etag = "\"legacy\"",
+            articles = example.articles.map { it.copy(thumbnailUrl = "https://publisher.example/image.png") },
+        )
+        val feedId = store.subscribe(website, null)
+        store.writableDatabase.apply {
+            execSQL("DROP INDEX article_viewed")
+            execSQL("DROP INDEX article_feed_newest")
+            execSQL("DROP TABLE article_feedback")
+            execSQL("ALTER TABLE feed DROP COLUMN home_url")
+            execSQL("ALTER TABLE feed DROP COLUMN is_favorite")
+            execSQL("ALTER TABLE article DROP COLUMN viewed_at")
+            execSQL("ALTER TABLE article DROP COLUMN dismissed")
+            version = 2
+        }
+        store.close()
+        store = FeedStore(RuntimeEnvironment.getApplication())
+        val subscription = store.subscriptions().single()
+        assertEquals(website.htmlItemSelector, subscription.htmlItemSelector)
+        assertFalse(subscription.isFavorite)
+        assertNull(subscription.etag)
+        val article = store.feedArticles(feedId, 10).articles.single()
+        assertEquals(website.articles.single().thumbnailUrl, article.thumbnailUrl)
+        assertFalse(article.dismissed)
+    }
+
+    @Test
+    fun upgradingVersionThreeKeepsExistingFeedLinksAndHistory() {
+        val feedId = store.subscribe(example, null)
+        val articleId = store.feedArticles(feedId, 10).articles.single().id
+        store.recordView(articleId)
+        store.writableDatabase.apply {
+            execSQL("DROP INDEX article_feed_newest")
+            execSQL("ALTER TABLE feed DROP COLUMN is_favorite")
+            version = 3
+        }
+        store.close()
+        store = FeedStore(RuntimeEnvironment.getApplication())
+
+        val feed = store.subscriptions().single()
+        assertEquals(example.home, feed.homeUrl)
+        assertFalse(feed.isFavorite)
+        assertEquals(articleId, store.history(10).articles.single().id)
+    }
+
+    @Test
+    fun upgradingVersionFourKeepsFavoritesAndComputesTheLatestArticleDate() {
+        val feedId = store.subscribe(example, null)
+        store.setFeedFavorite(feedId, true)
+        store.writableDatabase.apply {
+            execSQL("DROP INDEX article_feed_newest")
+            version = 4
+        }
+        store.close()
+        store = FeedStore(RuntimeEnvironment.getApplication())
+
+        val restored = store.subscriptions().single()
+        assertTrue(restored.isFavorite)
+        assertEquals(example.articles.single().published, restored.latestArticleAt)
     }
 }

@@ -14,6 +14,7 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -68,19 +69,37 @@ private enum class Section(val title: String, val icon: Int) {
     Articles("記事", R.drawable.ic_articles),
     Queues("キュー", R.drawable.ic_queues),
     Feeds("フィード", R.drawable.ic_rss),
+    History("閲覧履歴", R.drawable.ic_history),
 }
+
+private enum class DetailKind { Article, Feed }
+private data class DetailRoute(val kind: DetailKind, val id: Long)
+
+private val detailPathSaver = listSaver<List<DetailRoute>, String>(
+    save = { path -> path.map { "${it.kind.name}/${it.id}" } },
+    restore = { path ->
+        path.map { DetailRoute(DetailKind.valueOf(it.substringBefore('/')), it.substringAfter('/').toLong()) }
+    },
+)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun QarryScreen(library: FeedLibrary) {
     var section by rememberSaveable { mutableStateOf(Section.Articles) }
     var queueId by rememberSaveable { mutableStateOf<Long?>(null) }
-    var articleId by rememberSaveable { mutableStateOf<Long?>(null) }
+    var detailPath by rememberSaveable(stateSaver = detailPathSaver) { mutableStateOf(emptyList<DetailRoute>()) }
     var unread by rememberSaveable { mutableStateOf(false) }
+    var unassignedOnly by rememberSaveable { mutableStateOf(false) }
+    var favoritesOnly by rememberSaveable { mutableStateOf(false) }
+    var feedOrder by rememberSaveable { mutableStateOf(FeedOrder.Name) }
     var adding by rememberSaveable { mutableStateOf(false) }
     var limit by rememberSaveable { mutableIntStateOf(75) }
+    var historyLimit by rememberSaveable { mutableIntStateOf(75) }
+    var feedLimit by rememberSaveable { mutableIntStateOf(75) }
     var snapshot by remember { mutableStateOf<LibrarySnapshot?>(null) }
     var article by remember { mutableStateOf<Article?>(null) }
+    var history by remember { mutableStateOf<ArticleListing?>(null) }
+    var feedArticles by remember { mutableStateOf<Pair<Long, ArticleListing>?>(null) }
     var queueEditor by remember { mutableStateOf<QueueEditor?>(null) }
     var manageFeed by remember { mutableStateOf<Subscription?>(null) }
     var confirmDelete by remember { mutableStateOf<DeleteTarget?>(null) }
@@ -91,6 +110,9 @@ private fun QarryScreen(library: FeedLibrary) {
     val snackbars = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
+    val detail = detailPath.lastOrNull()
+    val articleId = detail?.id?.takeIf { detail.kind == DetailKind.Article }
+    val feedId = detail?.id?.takeIf { detail.kind == DetailKind.Feed }
 
     fun change(action: suspend () -> Unit) {
         scope.launch {
@@ -102,6 +124,41 @@ private fun QarryScreen(library: FeedLibrary) {
                 snackbars.showSnackbar("端末への保存または読み込みに失敗しました。")
             }
         }
+    }
+
+    fun navigateTo(route: DetailRoute) {
+        val index = detailPath.indexOf(route)
+        detailPath = if (index >= 0) detailPath.take(index + 1) else detailPath + route
+    }
+
+    fun openArticle(opened: Article) {
+        article = opened.copy(read = true)
+        navigateTo(DetailRoute(DetailKind.Article, opened.id))
+        change { library.recordView(opened.id) }
+    }
+
+    fun openFeed(id: Long) {
+        val route = DetailRoute(DetailKind.Feed, id)
+        if (route !in detailPath) feedLimit = 75
+        navigateTo(route)
+    }
+
+    fun openLink(address: String) {
+        webUrl(address)?.let { safeUrl ->
+            try {
+                context.startActivity(Intent(Intent.ACTION_VIEW, safeUrl.toUri()))
+            } catch (_: ActivityNotFoundException) {
+                change { snackbars.showSnackbar("URLを開けるアプリがありません。") }
+            }
+        }
+    }
+
+    suspend fun dismissArticle(selected: Article, rating: ArticleRating?): Boolean = try {
+        library.dismissArticle(selected.id, rating)
+        true
+    } catch (_: android.database.sqlite.SQLiteException) {
+        change { snackbars.showSnackbar("記事を保存または削除できませんでした。") }
+        false
     }
 
     val importPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -141,8 +198,19 @@ private fun QarryScreen(library: FeedLibrary) {
         }
     }
 
-    LaunchedEffect(articleId, revision) {
-        article = articleId?.let { library.article(it) }
+    LaunchedEffect(articleId, feedId, section, revision, feedLimit, historyLimit) {
+        try {
+            when {
+                articleId != null -> {
+                    val loaded = library.article(articleId)
+                    if (loaded == null) detailPath = detailPath.dropLast(1) else article = loaded
+                }
+                feedId != null -> feedArticles = feedId to library.feedArticles(feedId, feedLimit)
+                section == Section.History -> history = library.history(historyLimit)
+            }
+        } catch (_: android.database.sqlite.SQLiteException) {
+            snackbars.showSnackbar("端末のデータを読み込めませんでした。")
+        }
     }
 
     fun chooseQueue(id: Long?) {
@@ -153,24 +221,27 @@ private fun QarryScreen(library: FeedLibrary) {
     fun back() {
         when {
             adding -> adding = false
-            articleId != null -> {
-                article = null
-                articleId = null
-            }
+            detailPath.isNotEmpty() -> detailPath = detailPath.dropLast(1)
             section != Section.Articles -> section = Section.Articles
             else -> chooseQueue(null)
         }
     }
 
-    BackHandler(adding || articleId != null || section != Section.Articles || queueId != null) { back() }
-    val detail = articleId != null
-    val fullScreen = adding || detail
+    BackHandler(adding || detail != null || section != Section.Articles || queueId != null) { back() }
+    val fullScreen = adding || detail != null
     Scaffold(
         topBar = {
             TopAppBar(
                 title = {
                     if (fullScreen) {
-                        Text(if (adding) "フィードを追加" else "記事", style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            when {
+                                adding -> "フィードを追加"
+                                feedId != null -> "フィード詳細"
+                                else -> "記事"
+                            },
+                            style = MaterialTheme.typography.titleMedium,
+                        )
                     } else {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Image(painterResource(R.drawable.ic_qarry_foreground), null, Modifier.size(48.dp))
@@ -232,34 +303,60 @@ private fun QarryScreen(library: FeedLibrary) {
                             change { snackbars.showSnackbar("フィードを登録しました") }
                         },
                     )
-                    detail -> article?.let { opened ->
+                    articleId != null -> article?.takeIf { it.id == articleId }?.let { opened ->
                         ArticlePage(
                             article = opened,
-                            onReadChange = { read -> change { library.markRead(opened.id, read) } },
-                            onOpen = { address ->
-                                webUrl(address)?.let { safeUrl ->
-                                    try {
-                                        context.startActivity(Intent(Intent.ACTION_VIEW, safeUrl.toUri()))
-                                    } catch (_: ActivityNotFoundException) {
-                                        change { snackbars.showSnackbar("URLを開けるアプリがありません。") }
-                                    }
+                            onFeed = { openFeed(opened.feedId) },
+                            onRemove = {
+                                scope.launch {
+                                    if (dismissArticle(opened, null) && detailPath.lastOrNull() == detail) back()
                                 }
                             },
+                            onReadChange = { read -> change { library.markRead(opened.id, read) } },
+                            onOpen = ::openLink,
                             modifier = page,
                         )
                     } ?: CircularProgressIndicator(Modifier.padding(28.dp))
                     content == null -> CircularProgressIndicator(Modifier.padding(28.dp))
+                    feedId != null -> {
+                        val feed = content.subscriptions.firstOrNull { it.id == feedId }
+                        val listing = feedArticles?.takeIf { it.first == feedId }?.second
+                        when {
+                            feed == null -> EmptyState("フィードが見つかりません", null)
+                            listing == null -> CircularProgressIndicator(Modifier.padding(28.dp))
+                            else -> FeedDetailPage(
+                                feed = feed,
+                                queues = content.queues.filter { it.id in feed.queueIds },
+                                listing = listing,
+                                refreshing = refreshing,
+                                onLink = ::openLink,
+                                onQueue = { id ->
+                                    chooseQueue(id)
+                                    detailPath = emptyList()
+                                    section = Section.Articles
+                                },
+                                onManage = { manageFeed = feed },
+                                onFavoriteChange = { favorite -> change { library.setFeedFavorite(feed.id, favorite) } },
+                                onRefresh = { change { library.refresh(feed.id) } },
+                                onUnsubscribe = { confirmDelete = DeleteTarget.Feed(feed) },
+                                onArticle = ::openArticle,
+                                onDismiss = ::dismissArticle,
+                                onMore = { feedLimit += 75 },
+                                modifier = page,
+                            )
+                        }
+                    }
+                    section == Section.History -> history?.let { listing ->
+                        HistoryPage(listing, ::openArticle, ::dismissArticle, onMore = { historyLimit += 75 }, modifier = page)
+                    } ?: CircularProgressIndicator(Modifier.padding(28.dp))
                     section == Section.Articles -> ArticlesPage(
                         content, queueId, unread,
                         onQueue = ::chooseQueue,
                         onUnread = { unread = !unread; limit = 75 },
                         onAdd = { adding = true },
                         onMore = { limit += 75 },
-                        onArticle = { opened ->
-                            article = opened.copy(read = true)
-                            articleId = opened.id
-                            if (!opened.read) change { library.markRead(opened.id, true) }
-                        },
+                        onArticle = ::openArticle,
+                        onDismiss = ::dismissArticle,
                         modifier = page,
                     )
                     section == Section.Queues -> QueuesPage(
@@ -273,6 +370,12 @@ private fun QarryScreen(library: FeedLibrary) {
                     else -> FeedsPage(
                         content, refreshing,
                         importing = importing,
+                        unassignedOnly = unassignedOnly,
+                        onUnassignedOnly = { unassignedOnly = !unassignedOnly },
+                        favoritesOnly = favoritesOnly,
+                        onFavoritesOnly = { favoritesOnly = !favoritesOnly },
+                        order = feedOrder,
+                        onOrder = { feedOrder = it },
                         onImport = {
                             if (!choosingOpml && !importing) {
                                 choosingOpml = true
@@ -285,6 +388,7 @@ private fun QarryScreen(library: FeedLibrary) {
                             }
                         },
                         onAdd = { adding = true },
+                        onOpen = { openFeed(it.id) },
                         onManage = { manageFeed = it },
                         onRefresh = { feed -> change { library.refresh(feed.id) } },
                         onDelete = { confirmDelete = DeleteTarget.Feed(it) },
@@ -334,7 +438,13 @@ private fun QarryScreen(library: FeedLibrary) {
                     confirmDelete = null
                     change {
                         when (target) {
-                            is DeleteTarget.Feed -> library.removeFeed(target.feed.id)
+                            is DeleteTarget.Feed -> {
+                                library.removeFeed(target.feed.id)
+                                if (feedId == target.feed.id) {
+                                    detailPath = emptyList()
+                                    section = Section.Feeds
+                                }
+                            }
                             is DeleteTarget.Queue -> {
                                 library.removeQueue(target.queue.id)
                                 if (queueId == target.queue.id) chooseQueue(null)

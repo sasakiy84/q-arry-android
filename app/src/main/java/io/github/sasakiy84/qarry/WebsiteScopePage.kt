@@ -9,11 +9,13 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -61,6 +63,25 @@ internal fun WebsiteScopePage(
             }
             key(selectedIndex) {
                 LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(horizontal = 20.dp)) {
+                    selected.feed.htmlItemSelector?.let { selector ->
+                        item {
+                            Column(
+                                Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp),
+                            ) {
+                                Text("クエリパス（CSSセレクター）", style = MaterialTheme.typography.labelMedium)
+                                SelectionContainer {
+                                    Text(
+                                        selector,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        fontFamily = FontFamily.Monospace,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                            HorizontalDivider()
+                        }
+                    }
                     items(selected.feed.articles, key = { it.key }) { article ->
                         Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
                             Text(

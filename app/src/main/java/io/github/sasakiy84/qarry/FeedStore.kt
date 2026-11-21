@@ -16,7 +16,15 @@ data class Subscription(
     val error: String?,
     val queueIds: Set<Long>,
     val htmlItemSelector: String? = null,
+    val homeUrl: String? = null,
+    val isFavorite: Boolean = false,
+    val latestArticleAt: Long? = null,
 )
+
+enum class ArticleRating(val value: Int, val label: String) {
+    Good(1, "Good"),
+    Bad(-1, "Bad"),
+}
 
 data class Article(
     val id: Long,
@@ -27,11 +35,17 @@ data class Article(
     val published: Long?,
     val read: Boolean,
     val thumbnailUrl: String? = null,
+    val feedId: Long,
+    val viewedAt: Long?,
+    val dismissed: Boolean,
+    val rating: ArticleRating?,
 ) {
     val displayTitle: String get() = title ?: url ?: "無題の記事"
 }
 
 data class FeedQueue(val id: Long, val name: String, val feedCount: Int)
+
+data class ArticleListing(val articles: List<Article>, val hasMore: Boolean)
 
 data class LibrarySnapshot(
     val subscriptions: List<Subscription> = emptyList(),
@@ -40,7 +54,7 @@ data class LibrarySnapshot(
     val hasMore: Boolean = false,
 )
 
-class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null, 2) {
+class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null, 5) {
     override fun onConfigure(db: SQLiteDatabase): Unit = db.setForeignKeyConstraintsEnabled(true)
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -54,7 +68,9 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
                 modified TEXT,
                 refreshed_at INTEGER,
                 error TEXT,
-                html_item_selector TEXT
+                html_item_selector TEXT,
+                home_url TEXT,
+                is_favorite INTEGER NOT NULL DEFAULT 0
             )
             """.trimIndent(),
         )
@@ -71,11 +87,14 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
                 discovered INTEGER NOT NULL,
                 read INTEGER NOT NULL DEFAULT 0,
                 thumbnail_url TEXT,
+                viewed_at INTEGER,
+                dismissed INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(feed_id, entry_key)
             )
             """.trimIndent(),
         )
         db.execSQL("CREATE INDEX article_newest ON article(COALESCE(published, discovered) DESC, id DESC)")
+        db.execSQL(FEED_ARTICLE_INDEX)
         db.execSQL("CREATE TABLE queue (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE COLLATE NOCASE)")
         db.execSQL(
             """
@@ -87,12 +106,45 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
             """.trimIndent(),
         )
         db.execSQL("CREATE INDEX feed_queue_by_queue ON feed_queue(queue_id, feed_id)")
+        createArticleFeedback(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        check(oldVersion == 1 && newVersion == 2) { "No database migration from $oldVersion to $newVersion" }
-        db.execSQL("ALTER TABLE feed ADD COLUMN html_item_selector TEXT")
-        db.execSQL("ALTER TABLE article ADD COLUMN thumbnail_url TEXT")
+        check(oldVersion in 1..4 && newVersion == 5) { "No database migration from $oldVersion to $newVersion" }
+        if (oldVersion == 1) {
+            db.execSQL("ALTER TABLE feed ADD COLUMN html_item_selector TEXT")
+            db.execSQL("ALTER TABLE article ADD COLUMN thumbnail_url TEXT")
+        }
+        if (oldVersion < 3) {
+            db.execSQL("ALTER TABLE feed ADD COLUMN home_url TEXT")
+            db.execSQL("ALTER TABLE article ADD COLUMN viewed_at INTEGER")
+            db.execSQL("ALTER TABLE article ADD COLUMN dismissed INTEGER NOT NULL DEFAULT 0")
+            createArticleFeedback(db)
+            // Fetch the feed metadata once so existing subscriptions can acquire their site links.
+            db.execSQL("UPDATE feed SET etag = NULL, modified = NULL")
+        }
+        if (oldVersion < 4) db.execSQL("ALTER TABLE feed ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0")
+        db.execSQL(FEED_ARTICLE_INDEX)
+    }
+
+    private fun createArticleFeedback(db: SQLiteDatabase) {
+        db.execSQL("CREATE INDEX article_viewed ON article(viewed_at DESC, id DESC) WHERE viewed_at IS NOT NULL")
+        // Keep feedback when a feed and its articles are removed from the library.
+        db.execSQL(
+            """
+            CREATE TABLE article_feedback (
+                feed_url TEXT NOT NULL,
+                entry_key TEXT NOT NULL,
+                article_url TEXT,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                published_at INTEGER,
+                rating INTEGER NOT NULL CHECK(rating IN (-1, 1)),
+                rated_at INTEGER NOT NULL,
+                PRIMARY KEY(feed_url, entry_key)
+            )
+            """.trimIndent(),
+        )
     }
 
     fun load(queueId: Long?, unreadOnly: Boolean, limit: Int): LibrarySnapshot =
@@ -105,43 +157,53 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
                 """.trimIndent(),
                 null,
             ).use { cursor -> cursor.rows { FeedQueue(getLong(0), getString(1), getInt(2)) } }
-            val filter = buildList {
+            val filters = buildList {
+                add(ACTIVE_ARTICLE)
                 if (queueId != null) add("EXISTS (SELECT 1 FROM feed_queue fq WHERE fq.feed_id = a.feed_id AND fq.queue_id = ?)")
                 if (unreadOnly) add("a.read = 0")
-            }.joinToString(" AND ").takeIf(String::isNotEmpty)?.let { "WHERE $it" }.orEmpty()
-            val args = listOfNotNull(queueId?.toString(), (limit + 1).toString()).toTypedArray()
-            val articles = rawQuery(
-                """
-                SELECT a.id, f.title, NULLIF(a.title, ''), a.url, NULLIF(SUBSTR(a.body, 1, 240), ''), a.published, a.read, a.thumbnail_url
-                FROM article a JOIN feed f ON f.id = a.feed_id
-                $filter
-                ORDER BY COALESCE(a.published, a.discovered) DESC, a.id DESC LIMIT ?
-                """.trimIndent(),
-                args,
-            ).use { cursor ->
-                cursor.rows {
-                    readArticle()
-                }
             }
-            LibrarySnapshot(subscriptions(this), queues, articles.take(limit), articles.size > limit)
+            val listing = articleListing(filters.joinToString(" AND "), listOfNotNull(queueId?.toString()), limit)
+            LibrarySnapshot(subscriptions(this), queues, listing.articles, listing.hasMore)
         }
 
     fun subscriptions(): List<Subscription> = subscriptions(readableDatabase)
 
+    fun feedArticles(feedId: Long, limit: Int): ArticleListing =
+        readableDatabase.articleListing("$ACTIVE_ARTICLE AND a.feed_id = ?", listOf(feedId.toString()), limit)
+
+    fun history(limit: Int): ArticleListing =
+        readableDatabase.articleListing("a.viewed_at IS NOT NULL", emptyList(), limit, "a.viewed_at DESC, a.id DESC")
+
     fun article(id: Long): Article? = readableDatabase.rawQuery(
-        """
-        SELECT a.id, f.title, NULLIF(a.title, ''), a.url, NULLIF(a.body, ''), a.published, a.read, a.thumbnail_url
-        FROM article a JOIN feed f ON f.id = a.feed_id WHERE a.id = ?
-        """.trimIndent(),
+        "${articleQuery("a.body")} WHERE a.id = ?",
         arrayOf(id.toString()),
     ).use { cursor -> if (cursor.moveToFirst()) cursor.readArticle() else null }
+
+    private fun SQLiteDatabase.articleListing(
+        where: String,
+        args: List<String>,
+        limit: Int,
+        order: String = "COALESCE(a.published, a.discovered) DESC, a.id DESC",
+    ): ArticleListing {
+        val articles = rawQuery(
+            "${articleQuery("SUBSTR(a.body, 1, 240)")} WHERE $where ORDER BY $order LIMIT ?",
+            (args + (limit + 1).toString()).toTypedArray(),
+        ).use { cursor -> cursor.rows { readArticle() } }
+        return ArticleListing(articles.take(limit), articles.size > limit)
+    }
 
     private fun subscriptions(db: SQLiteDatabase): List<Subscription> {
         val membership = db.rawQuery("SELECT feed_id, queue_id FROM feed_queue", null).use { cursor ->
             cursor.rows { getLong(0) to getLong(1) }.groupBy({ it.first }, { it.second })
         }
         return db.rawQuery(
-            "SELECT id, url, title, etag, modified, refreshed_at, error, html_item_selector FROM feed ORDER BY title COLLATE NOCASE",
+            """
+            SELECT f.id, f.url, f.title, f.etag, f.modified, f.refreshed_at, f.error, f.html_item_selector,
+                   f.home_url, f.is_favorite,
+                   (SELECT COALESCE(a.published, a.discovered) FROM article a WHERE a.feed_id = f.id
+                    ORDER BY COALESCE(a.published, a.discovered) DESC LIMIT 1)
+            FROM feed f ORDER BY f.title COLLATE NOCASE
+            """.trimIndent(),
             null,
         ).use { cursor ->
             cursor.rows {
@@ -156,6 +218,9 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
                     error = getString(6),
                     queueIds = membership[id].orEmpty().toSet(),
                     htmlItemSelector = getString(7),
+                    homeUrl = getString(8),
+                    isFavorite = getInt(9) != 0,
+                    latestArticleAt = nullableLong(10),
                 )
             }
         }
@@ -230,8 +295,29 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
     fun removeFeed(id: Long): Unit =
         writableDatabase.execSQL("DELETE FROM feed WHERE id = ?", arrayOf(id))
 
+    fun setFeedFavorite(id: Long, favorite: Boolean): Unit =
+        writableDatabase.execSQL("UPDATE feed SET is_favorite = ? WHERE id = ?", arrayOf(if (favorite) 1 else 0, id))
+
     fun setRead(id: Long, read: Boolean): Unit =
         writableDatabase.execSQL("UPDATE article SET read = ? WHERE id = ?", arrayOf(if (read) 1 else 0, id))
+
+    fun recordView(id: Long, viewedAt: Long = System.currentTimeMillis()): Unit =
+        writableDatabase.execSQL("UPDATE article SET read = 1, viewed_at = ? WHERE id = ?", arrayOf(viewedAt, id))
+
+    fun dismissArticle(id: Long, rating: ArticleRating?): Unit = writableDatabase.transaction {
+        val dismissed = ContentValues().apply { put("dismissed", 1) }
+        if (update("article", dismissed, "id = ? AND dismissed = 0", arrayOf(id.toString())) == 0) return@transaction
+        if (rating != null) {
+            execSQL(
+                """
+                INSERT OR IGNORE INTO article_feedback(feed_url, entry_key, article_url, title, body, published_at, rating, rated_at)
+                SELECT f.url, a.entry_key, a.url, a.title, a.body, a.published, ?, ?
+                FROM article a JOIN feed f ON f.id = a.feed_id WHERE a.id = ?
+                """.trimIndent(),
+                arrayOf<Any>(rating.value, System.currentTimeMillis(), id),
+            )
+        }
+    }
 
     private fun SQLiteDatabase.saveDocument(feedId: Long, document: FeedDocument, now: Long) {
         val metadata = ContentValues().apply {
@@ -239,6 +325,7 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
             put("etag", document.etag)
             put("modified", document.modified)
             put("html_item_selector", document.htmlItemSelector)
+            document.home?.let { put("home_url", it) }
             put("refreshed_at", now)
             putNull("error")
         }
@@ -268,7 +355,24 @@ private inline fun <T> Cursor.rows(readRow: Cursor.() -> T): List<T> =
 private fun Cursor.nullableLong(column: Int): Long? = if (isNull(column)) null else getLong(column)
 
 private fun Cursor.readArticle(): Article =
-    Article(getLong(0), getString(1), getString(2), getString(3), getString(4), nullableLong(5), getInt(6) != 0, getString(7))
+    Article(
+        id = getLong(0), feedTitle = getString(1), title = getString(2), url = getString(3),
+        body = getString(4), published = nullableLong(5), read = getInt(6) != 0, thumbnailUrl = getString(7),
+        feedId = getLong(8), viewedAt = nullableLong(9), dismissed = getInt(10) != 0,
+        rating = ArticleRating.entries.firstOrNull { it.value == getInt(11) },
+    )
+
+private const val ACTIVE_ARTICLE = "a.dismissed = 0 AND r.rating IS NULL"
+private const val FEED_ARTICLE_INDEX =
+    "CREATE INDEX article_feed_newest ON article(feed_id, COALESCE(published, discovered) DESC)"
+
+private fun articleQuery(body: String): String = """
+    SELECT a.id, f.title, NULLIF(a.title, ''), a.url, NULLIF($body, ''), a.published, a.read,
+           a.thumbnail_url, a.feed_id, a.viewed_at, a.dismissed OR r.rating IS NOT NULL, r.rating
+    FROM article a
+    JOIN feed f ON f.id = a.feed_id
+    LEFT JOIN article_feedback r ON r.feed_url = f.url AND r.entry_key = a.entry_key
+""".trimIndent()
 
 private inline fun <T> SQLiteDatabase.transaction(block: SQLiteDatabase.() -> T): T {
     beginTransactionNonExclusive()

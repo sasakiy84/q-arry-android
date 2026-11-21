@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.text.KeyboardActions
@@ -16,9 +17,12 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -29,6 +33,7 @@ import kotlinx.coroutines.launch
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.Locale
 
 private val pagePadding = PaddingValues(start = 20.dp, end = 20.dp, top = 16.dp, bottom = 28.dp)
 
@@ -42,6 +47,7 @@ fun ArticlesPage(
     onAdd: () -> Unit,
     onMore: () -> Unit,
     onArticle: (Article) -> Unit,
+    onDismiss: suspend (Article, ArticleRating?) -> Boolean,
     modifier: Modifier = Modifier,
 ) {
     Column(modifier) {
@@ -85,73 +91,29 @@ fun ArticlesPage(
                 actionLabel = "フィードを追加",
             )
         } else {
+            SwipeHint()
             LazyColumn(modifier = Modifier.weight(1f), contentPadding = PaddingValues(bottom = 24.dp)) {
-                items(snapshot.articles, key = { it.id }) { article ->
-                    ArticleRow(article, onClick = { onArticle(article) })
-                    HorizontalDivider(Modifier.padding(horizontal = 20.dp))
-                }
-                if (snapshot.hasMore) item {
-                    TextButton(onMore, Modifier.padding(start = 12.dp, top = 8.dp)) { Text("さらに表示") }
-                }
+                articleCards(snapshot.articles, onArticle, onDismiss)
+                if (snapshot.hasMore) moreArticles(onMore)
             }
         }
     }
 }
 
 @Composable
-private fun ArticleRow(article: Article, onClick: () -> Unit) {
-    Column(
-        Modifier.fillMaxWidth().clickable(role = Role.Button, onClick = onClick)
-            .padding(horizontal = 20.dp, vertical = 15.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                article.feedTitle,
-                Modifier.weight(1f),
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.primary,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            if (!article.read) Text("未読", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.tertiary)
-            article.published?.let {
-                Text(entryDate(it), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-        }
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text(
-                    article.displayTitle,
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = if (article.read) FontWeight.Medium else FontWeight.SemiBold,
-                    maxLines = 3,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                article.body?.let { description ->
-                    Text(
-                        description.take(240).trim(),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-            }
-            ArticleThumbnail(
-                article.url,
-                article.thumbnailUrl,
-                Modifier.size(width = 84.dp, height = 64.dp),
-            )
-        }
-    }
-}
-
-@Composable
-fun ArticlePage(article: Article, onReadChange: (Boolean) -> Unit, onOpen: (String) -> Unit, modifier: Modifier = Modifier) {
+fun ArticlePage(
+    article: Article,
+    onFeed: () -> Unit,
+    onRemove: () -> Unit,
+    onReadChange: (Boolean) -> Unit,
+    onOpen: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
     LazyColumn(modifier, contentPadding = pagePadding, verticalArrangement = Arrangement.spacedBy(18.dp)) {
         item {
-            Text(article.feedTitle, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+            TextButton(onFeed, contentPadding = PaddingValues(0.dp)) {
+                Text(article.feedTitle, style = MaterialTheme.typography.labelLarge)
+            }
             Spacer(Modifier.height(8.dp))
             Text(article.displayTitle, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
             article.published?.let {
@@ -170,6 +132,15 @@ fun ArticlePage(article: Article, onReadChange: (Boolean) -> Unit, onOpen: (Stri
                 }
                 TextButton(onClick = { onReadChange(!article.read) }) {
                     Text(if (article.read) "未読に戻す" else "既読にする")
+                }
+                if (article.dismissed) {
+                    Text(
+                        article.rating?.let { "${it.label} ・ キューから削除済み" } ?: "キューから削除済み",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    TextButton(onRemove) { Text("すべてのキューから削除") }
                 }
             }
             HorizontalDivider()
@@ -226,12 +197,19 @@ fun QueuesPage(
 }
 
 @Composable
-fun FeedsPage(
+internal fun FeedsPage(
     snapshot: LibrarySnapshot,
     refreshing: Boolean,
     importing: Boolean,
+    unassignedOnly: Boolean,
+    onUnassignedOnly: () -> Unit,
+    favoritesOnly: Boolean,
+    onFavoritesOnly: () -> Unit,
+    order: FeedOrder,
+    onOrder: (FeedOrder) -> Unit,
     onImport: () -> Unit,
     onAdd: () -> Unit,
+    onOpen: (Subscription) -> Unit,
     onManage: (Subscription) -> Unit,
     onRefresh: (Subscription) -> Unit,
     onDelete: (Subscription) -> Unit,
@@ -244,20 +222,52 @@ fun FeedsPage(
             }
             Button(onAdd) { Text("追加") }
         }
+        if (snapshot.subscriptions.isNotEmpty()) {
+            FlowRow(
+                Modifier.padding(start = 20.dp, end = 20.dp, bottom = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                FilterChip(selected = favoritesOnly, onClick = onFavoritesOnly, label = { Text("お気に入りのみ") })
+                FilterChip(selected = unassignedOnly, onClick = onUnassignedOnly, label = { Text("キュー未設定のみ") })
+            }
+            Box(Modifier.align(Alignment.End).padding(end = 12.dp)) {
+                FeedOrderMenu(order, onOrder)
+            }
+        }
         HorizontalDivider()
+        val locale = LocalConfiguration.current.locales[0] ?: Locale.getDefault()
+        val feeds = remember(snapshot.subscriptions, order, unassignedOnly, favoritesOnly, locale) {
+            order.sort(snapshot.subscriptions.filter {
+                (!unassignedOnly || it.queueIds.isEmpty()) && (!favoritesOnly || it.isFavorite)
+            }, locale)
+        }
         if (snapshot.subscriptions.isEmpty()) {
             EmptyState("フィードがありません", "URLを入力するか、OPMLをインポートして追加できます。")
+        } else if (feeds.isEmpty()) {
+            EmptyState("条件に合うフィードはありません", null)
         } else {
             val names = snapshot.queues.associate { it.id to it.name }
-            LazyColumn(contentPadding = PaddingValues(bottom = 24.dp)) {
-                items(snapshot.subscriptions, key = { it.id }) { feed ->
+            val listState = key(order) { rememberLazyListState() }
+            LazyColumn(state = listState, contentPadding = PaddingValues(bottom = 24.dp)) {
+                items(feeds, key = { it.id }) { feed ->
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                         Column(
-                            Modifier.weight(1f).clickable(role = Role.Button) { onManage(feed) }
+                            Modifier.weight(1f).clickable(role = Role.Button) { onOpen(feed) }
                                 .padding(horizontal = 20.dp, vertical = 16.dp),
                             verticalArrangement = Arrangement.spacedBy(4.dp),
                         ) {
-                            Text(feed.title, style = MaterialTheme.typography.titleMedium)
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                if (feed.isFavorite) {
+                                    Icon(
+                                        painterResource(R.drawable.ic_favorite), "お気に入り",
+                                        Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary,
+                                    )
+                                }
+                                Text(feed.title, style = MaterialTheme.typography.titleMedium)
+                            }
                             Text(
                                 hostLabel(feed.url),
                                 style = MaterialTheme.typography.labelMedium,
@@ -285,6 +295,27 @@ fun FeedsPage(
                     HorizontalDivider(Modifier.padding(horizontal = 20.dp))
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun FeedOrderMenu(order: FeedOrder, onOrder: (FeedOrder) -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    TextButton(onClick = { expanded = true }) {
+        Text("並び替え　${order.label}")
+    }
+    DropdownMenu(expanded, onDismissRequest = { expanded = false }) {
+        for (choice in FeedOrder.entries) {
+            DropdownMenuItem(
+                text = { Text(choice.label) },
+                onClick = {
+                    onOrder(choice)
+                    expanded = false
+                },
+                modifier = Modifier.semantics { selected = choice == order },
+                trailingIcon = if (choice == order) { { Text("✓") } } else null,
+            )
         }
     }
 }
@@ -497,7 +528,7 @@ fun QueueMembershipDialog(
 }
 
 @Composable
-private fun PageHeading(title: String, action: @Composable () -> Unit) {
+internal fun PageHeading(title: String, action: @Composable () -> Unit) {
     FlowRow(
         Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 7.dp, bottom = 12.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
@@ -521,7 +552,7 @@ private fun PageHeading(title: String, action: @Composable () -> Unit) {
 }
 
 @Composable
-private fun EmptyState(
+internal fun EmptyState(
     title: String,
     description: String?,
     action: (() -> Unit)? = null,
@@ -554,7 +585,7 @@ private fun RowMenu(description: String, actions: List<Pair<String, () -> Unit>>
 
 private val entryDateFormat = DateTimeFormatter.ofPattern("yyyy/M/d")
 
-private fun entryDate(epoch: Long): String =
+internal fun entryDate(epoch: Long): String =
     entryDateFormat.format(Instant.ofEpochMilli(epoch).atZone(ZoneId.systemDefault()))
 
 private fun hostLabel(url: String): String = java.net.URI(url).host ?: url

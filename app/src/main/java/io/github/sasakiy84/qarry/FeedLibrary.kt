@@ -95,6 +95,12 @@ class FeedLibrary(private val store: FeedStore, private val client: FeedClient) 
 
     suspend fun article(id: Long): Article? = runInterruptible(Dispatchers.IO) { store.article(id) }
 
+    suspend fun feedArticles(feedId: Long, limit: Int): ArticleListing =
+        runInterruptible(Dispatchers.IO) { store.feedArticles(feedId, limit) }
+
+    suspend fun history(limit: Int): ArticleListing =
+        runInterruptible(Dispatchers.IO) { store.history(limit) }
+
     suspend fun articleThumbnail(url: String): String? = thumbnailConnections.withPermit {
         thumbnailLookups.get(url)?.takeIf { it.expiresAt > SystemClock.elapsedRealtime() }
             ?.let { return@withPermit it.imageUrl }
@@ -140,7 +146,10 @@ class FeedLibrary(private val store: FeedStore, private val client: FeedClient) 
     suspend fun nameQueue(id: Long?, name: String): Boolean = change { store.queueName(id, name) }
     suspend fun removeQueue(id: Long): Unit = change { store.removeQueue(id) }
     suspend fun removeFeed(id: Long): Unit = change { store.removeFeed(id) }
+    suspend fun setFeedFavorite(id: Long, favorite: Boolean): Unit = change { store.setFeedFavorite(id, favorite) }
     suspend fun markRead(id: Long, read: Boolean): Unit = change { store.setRead(id, read) }
+    suspend fun recordView(id: Long): Unit = change { store.recordView(id) }
+    suspend fun dismissArticle(id: Long, rating: ArticleRating?): Unit = change { store.dismissArticle(id, rating) }
 
     suspend fun refresh(onlyFeed: Long? = null) {
         if (!refreshLock.tryLock()) return
