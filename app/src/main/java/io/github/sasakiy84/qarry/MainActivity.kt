@@ -69,7 +69,7 @@ private enum class Section(val title: String, val icon: Int) {
     Articles("記事", R.drawable.ic_articles),
     Queues("キュー", R.drawable.ic_queues),
     Feeds("フィード", R.drawable.ic_rss),
-    History("閲覧履歴", R.drawable.ic_history),
+    History("履歴", R.drawable.ic_history),
 }
 
 private enum class DetailKind { Article, Feed }
@@ -94,11 +94,14 @@ private fun QarryScreen(library: FeedLibrary) {
     var feedOrder by rememberSaveable { mutableStateOf(FeedOrder.Name) }
     var adding by rememberSaveable { mutableStateOf(false) }
     var limit by rememberSaveable { mutableIntStateOf(75) }
+    var historyTab by rememberSaveable { mutableStateOf(HistoryTab.Viewed) }
     var historyLimit by rememberSaveable { mutableIntStateOf(75) }
+    var ratingLimit by rememberSaveable { mutableIntStateOf(75) }
     var feedLimit by rememberSaveable { mutableIntStateOf(75) }
     var snapshot by remember { mutableStateOf<LibrarySnapshot?>(null) }
     var article by remember { mutableStateOf<Article?>(null) }
     var history by remember { mutableStateOf<ArticleListing?>(null) }
+    var ratings by remember { mutableStateOf<RatingListing?>(null) }
     var feedArticles by remember { mutableStateOf<Pair<Long, ArticleListing>?>(null) }
     var queueEditor by remember { mutableStateOf<QueueEditor?>(null) }
     var manageFeed by remember { mutableStateOf<Subscription?>(null) }
@@ -131,10 +134,14 @@ private fun QarryScreen(library: FeedLibrary) {
         detailPath = if (index >= 0) detailPath.take(index + 1) else detailPath + route
     }
 
+    fun openArticleById(id: Long) {
+        navigateTo(DetailRoute(DetailKind.Article, id))
+        change { library.recordView(id) }
+    }
+
     fun openArticle(opened: Article) {
         article = opened.copy(read = true)
-        navigateTo(DetailRoute(DetailKind.Article, opened.id))
-        change { library.recordView(opened.id) }
+        openArticleById(opened.id)
     }
 
     fun openFeed(id: Long) {
@@ -198,7 +205,7 @@ private fun QarryScreen(library: FeedLibrary) {
         }
     }
 
-    LaunchedEffect(articleId, feedId, section, revision, feedLimit, historyLimit) {
+    LaunchedEffect(articleId, feedId, section, revision, feedLimit, historyTab, historyLimit, ratingLimit) {
         try {
             when {
                 articleId != null -> {
@@ -206,7 +213,10 @@ private fun QarryScreen(library: FeedLibrary) {
                     if (loaded == null) detailPath = detailPath.dropLast(1) else article = loaded
                 }
                 feedId != null -> feedArticles = feedId to library.feedArticles(feedId, feedLimit)
-                section == Section.History -> history = library.history(historyLimit)
+                section == Section.History -> when (historyTab) {
+                    HistoryTab.Viewed -> history = library.history(historyLimit)
+                    HistoryTab.Rated -> ratings = library.ratingHistory(ratingLimit)
+                }
             }
         } catch (_: android.database.sqlite.SQLiteException) {
             snackbars.showSnackbar("端末のデータを読み込めませんでした。")
@@ -346,9 +356,25 @@ private fun QarryScreen(library: FeedLibrary) {
                             )
                         }
                     }
-                    section == Section.History -> history?.let { listing ->
-                        HistoryPage(listing, ::openArticle, ::dismissArticle, onMore = { historyLimit += 75 }, modifier = page)
-                    } ?: CircularProgressIndicator(Modifier.padding(28.dp))
+                    section == Section.History -> HistoryPage(
+                        tab = historyTab,
+                        onTab = { historyTab = it },
+                        viewed = history,
+                        rated = ratings,
+                        onArticle = ::openArticle,
+                        onRatedArticle = { rated ->
+                            rated.articleId?.let(::openArticleById) ?: rated.url?.let(::openLink)
+                        },
+                        onDismiss = ::dismissArticle,
+                        onChangeRating = { key, rating -> change { library.changeRating(key, rating) } },
+                        onMore = {
+                            when (historyTab) {
+                                HistoryTab.Viewed -> historyLimit += 75
+                                HistoryTab.Rated -> ratingLimit += 75
+                            }
+                        },
+                        modifier = page,
+                    )
                     section == Section.Articles -> ArticlesPage(
                         content, queueId, unread,
                         onQueue = ::chooseQueue,

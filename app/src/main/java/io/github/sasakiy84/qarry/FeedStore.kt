@@ -47,6 +47,21 @@ data class FeedQueue(val id: Long, val name: String, val feedCount: Int)
 
 data class ArticleListing(val articles: List<Article>, val hasMore: Boolean)
 
+internal data class RatingKey(val feedUrl: String, val entryKey: String)
+
+internal data class RatedArticle(
+    val key: RatingKey,
+    val articleId: Long?,
+    val feedTitle: String,
+    val title: String,
+    val url: String?,
+    val thumbnailUrl: String?,
+    val rating: ArticleRating,
+    val ratedAt: Long,
+)
+
+internal data class RatingListing(val articles: List<RatedArticle>, val hasMore: Boolean)
+
 data class LibrarySnapshot(
     val subscriptions: List<Subscription> = emptyList(),
     val queues: List<FeedQueue> = emptyList(),
@@ -173,6 +188,29 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
 
     fun history(limit: Int): ArticleListing =
         readableDatabase.articleListing("a.viewed_at IS NOT NULL", emptyList(), limit, "a.viewed_at DESC, a.id DESC")
+
+    internal fun ratingHistory(limit: Int): RatingListing {
+        val articles = readableDatabase.rawQuery(
+            """
+            SELECT r.feed_url, r.entry_key, a.id, COALESCE(f.title, r.feed_url),
+                   COALESCE(NULLIF(a.title, ''), NULLIF(r.title, ''), a.url, r.article_url, '無題の記事'),
+                   COALESCE(a.url, r.article_url), a.thumbnail_url, r.rating, r.rated_at
+            FROM article_feedback r
+            LEFT JOIN feed f ON f.url = r.feed_url
+            LEFT JOIN article a ON a.feed_id = f.id AND a.entry_key = r.entry_key
+            ORDER BY r.rated_at DESC, r.rowid DESC LIMIT ?
+            """.trimIndent(),
+            arrayOf((limit + 1).toString()),
+        ).use { cursor ->
+            cursor.rows {
+                RatedArticle(
+                    RatingKey(getString(0), getString(1)), nullableLong(2), getString(3), getString(4),
+                    getString(5), getString(6), ArticleRating.entries.first { it.value == getInt(7) }, getLong(8),
+                )
+            }
+        }
+        return RatingListing(articles.take(limit), articles.size > limit)
+    }
 
     fun article(id: Long): Article? = readableDatabase.rawQuery(
         "${articleQuery("a.body")} WHERE a.id = ?",
@@ -315,6 +353,19 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
                 FROM article a JOIN feed f ON f.id = a.feed_id WHERE a.id = ?
                 """.trimIndent(),
                 arrayOf<Any>(rating.value, System.currentTimeMillis(), id),
+            )
+        }
+    }
+
+    internal fun changeRating(key: RatingKey, rating: ArticleRating?): Unit = writableDatabase.transaction {
+        val args = arrayOf(key.feedUrl, key.entryKey)
+        if (rating != null) {
+            val values = ContentValues().apply { put("rating", rating.value) }
+            update("article_feedback", values, "feed_url = ? AND entry_key = ?", args)
+        } else if (delete("article_feedback", "feed_url = ? AND entry_key = ?", args) > 0) {
+            execSQL(
+                "UPDATE article SET dismissed = 0 WHERE feed_id = (SELECT id FROM feed WHERE url = ?) AND entry_key = ?",
+                args,
             )
         }
     }

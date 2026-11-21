@@ -1,14 +1,21 @@
 package io.github.sasakiy84.qarry
 
+import androidx.compose.animation.core.animate
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.AbsoluteAlignment
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.CustomAccessibilityAction
@@ -18,8 +25,12 @@ import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlin.math.abs
+import kotlin.math.roundToInt
 
 internal fun LazyListScope.articleCards(
     articles: List<Article>,
@@ -45,58 +56,89 @@ private fun ArticleCard(
         return
     }
 
-    val swipe = rememberSwipeToDismissBoxState(positionalThreshold = { it * 0.42f })
     val scope = rememberCoroutineScope()
     var saving by remember { mutableStateOf(false) }
+    var width by remember { mutableIntStateOf(0) }
+    var offset by remember { mutableFloatStateOf(0f) }
+    var resetAnimation by remember { mutableStateOf<Job?>(null) }
+    val threshold = minOf(width * 0.45f, with(LocalDensity.current) { 192.dp.toPx() })
+
+    fun resetPosition() {
+        resetAnimation?.cancel()
+        if (offset != 0f) {
+            resetAnimation = scope.launch {
+                animate(offset, 0f, animationSpec = tween(160)) { value, _ -> offset = value }
+            }
+        }
+    }
 
     fun dismiss(rating: ArticleRating?) {
         if (saving) return
         saving = true
         scope.launch {
             try {
-                if (!onDismiss(article, rating)) swipe.reset()
+                if (!onDismiss(article, rating)) resetPosition()
             } finally {
                 saving = false
             }
         }
     }
 
-    SwipeToDismissBox(
-        state = swipe,
-        gesturesEnabled = !saving,
-        backgroundContent = {
-            val direction = swipe.dismissDirection
-            if (direction != SwipeToDismissBoxValue.Settled) {
-                val good = direction == SwipeToDismissBoxValue.StartToEnd
-                Box(
-                    Modifier.fillMaxSize()
-                        .background(if (good) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.errorContainer)
-                        .padding(horizontal = 24.dp)
-                        .clearAndSetSemantics { },
-                    contentAlignment = if (good) Alignment.CenterStart else Alignment.CenterEnd,
-                ) {
-                    Text(
-                        if (good) ArticleRating.Good.label else ArticleRating.Bad.label,
-                        color = if (good) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onErrorContainer,
-                        style = MaterialTheme.typography.titleMedium,
-                    )
-                }
-            }
-        },
-        onDismiss = { direction ->
-            when (direction) {
-                SwipeToDismissBoxValue.StartToEnd -> dismiss(ArticleRating.Good)
-                SwipeToDismissBoxValue.EndToStart -> dismiss(ArticleRating.Bad)
-                SwipeToDismissBoxValue.Settled -> Unit
-            }
-        },
+    val dismissLatest by rememberUpdatedState(::dismiss)
+    Box(
+        Modifier.fillMaxWidth().clipToBounds().onSizeChanged { width = it.width }
+            .pointerInput(width, threshold, saving) {
+                if (saving) return@pointerInput
+                detectHorizontalDragGestures(
+                    onDragStart = {
+                        resetAnimation?.cancel()
+                        offset = 0f
+                    },
+                    onHorizontalDrag = { _, delta -> offset = (offset + delta).coerceIn(-width.toFloat(), width.toFloat()) },
+                    onDragCancel = ::resetPosition,
+                    onDragEnd = {
+                        if (threshold > 0f && abs(offset) >= threshold) {
+                            dismissLatest(if (offset > 0f) ArticleRating.Good else ArticleRating.Bad)
+                        } else {
+                            resetPosition()
+                        }
+                    },
+                )
+            },
     ) {
+        if (offset != 0f) {
+            val good = offset > 0f
+            val ready = abs(offset) >= threshold
+            val colors = MaterialTheme.colorScheme
+            val background = when {
+                ready && good -> colors.primary
+                ready -> colors.error
+                good -> colors.primaryContainer
+                else -> colors.errorContainer
+            }
+            val textColor = when {
+                ready && good -> colors.onPrimary
+                ready -> colors.onError
+                good -> colors.onPrimaryContainer
+                else -> colors.onErrorContainer
+            }
+            Box(
+                Modifier.matchParentSize().background(background).padding(horizontal = 24.dp).clearAndSetSemantics { },
+                contentAlignment = if (good) AbsoluteAlignment.CenterLeft else AbsoluteAlignment.CenterRight,
+            ) {
+                Text(
+                    if (good) ArticleRating.Good.label else ArticleRating.Bad.label,
+                    color = textColor, style = MaterialTheme.typography.titleMedium,
+                )
+            }
+        }
         ArticleCardContent(
             article,
             history,
             onOpen,
             onRemove = { dismiss(null) },
             onRate = if (!saving) ({ rating -> dismiss(rating) }) else null,
+            modifier = Modifier.absoluteOffset { IntOffset(offset.roundToInt(), 0) },
         )
     }
 }
@@ -108,6 +150,7 @@ private fun ArticleCardContent(
     onOpen: () -> Unit,
     onRemove: (() -> Unit)?,
     onRate: ((ArticleRating) -> Unit)? = null,
+    modifier: Modifier = Modifier,
 ) {
     val typography = MaterialTheme.typography
     val height = with(LocalDensity.current) {
@@ -115,7 +158,7 @@ private fun ArticleCardContent(
             typography.bodySmall.lineHeight.toDp() * 2 + typography.bodySmall.fontSize.toDp()
     } + 32.dp
     Row(
-        Modifier.fillMaxWidth().height(height).background(MaterialTheme.colorScheme.surface)
+        modifier.fillMaxWidth().height(height).background(MaterialTheme.colorScheme.surface)
             .clickable(role = Role.Button, onClick = onOpen)
             .semantics {
                 if (onRate != null) customActions = ArticleRating.entries.map { rating ->

@@ -232,6 +232,59 @@ class FeedStoreTest {
     }
 
     @Test
+    fun ratingHistoryIncludesUnopenedArticlesAndAllowsChangingRatingsAfterUnsubscribe() {
+        val feedId = store.subscribe(example, null)
+        val original = store.load(null, false, 10).articles.single()
+        store.dismissArticle(original.id, ArticleRating.Good)
+        assertTrue(store.history(10).articles.isEmpty())
+        val originalRating = store.ratingHistory(10).articles.single()
+        assertEquals(original.id, originalRating.articleId)
+        assertEquals(ArticleRating.Good, originalRating.rating)
+
+        store.removeFeed(feedId)
+        store.changeRating(originalRating.key, ArticleRating.Bad)
+        val archivedRating = store.ratingHistory(10).articles.single()
+        assertNull(archivedRating.articleId)
+        assertEquals(original.displayTitle, archivedRating.title)
+        assertEquals(original.url, archivedRating.url)
+        assertEquals(originalRating.ratedAt, archivedRating.ratedAt)
+        assertEquals(ArticleRating.Bad, archivedRating.rating)
+
+        store.subscribe(example, null)
+        assertTrue(store.load(null, false, 10).articles.isEmpty())
+        val resubscribed = store.ratingHistory(10).articles.single()
+        assertEquals(ArticleRating.Bad, store.article(checkNotNull(resubscribed.articleId))?.rating)
+    }
+
+    @Test
+    fun clearingARecordedRatingRestoresTheArticleToAllQueues() {
+        val deletedEntry = example.articles.single().copy(key = "deleted", title = "Removed manually")
+        val feedId = store.subscribe(example.copy(articles = example.articles + deletedEntry), null)
+        store.queueName(null, "Research")
+        store.queueName(null, "Daily")
+        val queues = store.load(null, false, 10).queues
+        store.setMembership(feedId, queues.map { it.id }.toSet())
+        val articles = store.load(null, false, 10).articles.associateBy { it.title }
+        val rated = articles.getValue("First article")
+        val manuallyRemoved = articles.getValue("Removed manually")
+        store.dismissArticle(rated.id, ArticleRating.Bad)
+        store.dismissArticle(manuallyRemoved.id, null)
+        assertEquals(listOf(rated.id), store.ratingHistory(10).articles.map { it.articleId })
+
+        val key = store.ratingHistory(10).articles.single().key
+        store.changeRating(key, ArticleRating.Good)
+        assertEquals(ArticleRating.Good, store.article(rated.id)?.rating)
+        assertTrue(store.load(null, false, 10).articles.isEmpty())
+
+        store.changeRating(key, null)
+        store.changeRating(key, null)
+        assertTrue(store.ratingHistory(10).articles.isEmpty())
+        assertFalse(checkNotNull(store.article(rated.id)).dismissed)
+        assertTrue(checkNotNull(store.article(manuallyRemoved.id)).dismissed)
+        queues.forEach { queue -> assertEquals(rated.id, store.load(queue.id, false, 10).articles.single().id) }
+    }
+
+    @Test
     fun upgradingTheOriginalDatabaseRetainsExistingRssEntriesAndQueueMemberships() {
         assertTrue(store.queueName(null, "Research"))
         val queueId = store.load(null, false, 10).queues.single().id

@@ -11,6 +11,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Modifier
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -27,7 +28,7 @@ import java.time.Duration
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
 class ArticleSwipeTest {
     @Test
-    fun swipingArticleCardsRecordsBothRatingsAndRemovesThemFromEachQueue() {
+    fun onlyFullSwipesRecordRatingsAndRemoveArticlesFromEachQueue() {
         val context = RuntimeEnvironment.getApplication()
         FeedStore(context).use { store ->
             val feedId = store.subscribe(
@@ -65,12 +66,29 @@ class ArticleSwipeTest {
                 }
                 val root = activity.window.decorView
                 settle(root, 20)
-                swipe(root, from = 62f, to = 298f)
+                drag(root, listOf(130f, 230f), stepMillis = 4)
+                settle(root, 25)
+                assertNull("A fast short flick must not rate the article", store.article(goodArticle.id)?.rating)
+                assertEquals(listOf(goodArticle.id, badArticle.id), snapshot.value.articles.map { it.id })
+
+                drag(root, listOf(62f, 298f, 125f))
+                settle(root, 25)
+                assertNull("The final position must still be beyond the threshold", store.article(goodArticle.id)?.rating)
+
+                drag(root, listOf(62f, 298f), finish = MotionEvent.ACTION_CANCEL)
+                settle(root, 25)
+                assertNull("A cancelled touch must not rate the article", store.article(goodArticle.id)?.rating)
+
+                drag(root, listOf(62f, 298f))
                 settle(root, 55)
                 assertEquals(ArticleRating.Good, store.article(goodArticle.id)?.rating)
                 assertEquals(listOf(badArticle.id), snapshot.value.articles.map { it.id })
 
-                swipe(root, from = 298f, to = 62f)
+                drag(root, listOf(260f, 155f), stepMillis = 4)
+                settle(root, 25)
+                assertNull(store.article(badArticle.id)?.rating)
+
+                drag(root, listOf(298f, 62f))
                 settle(root, 55)
                 assertEquals(ArticleRating.Bad, store.article(badArticle.id)?.rating)
                 assertTrue(snapshot.value.articles.isEmpty())
@@ -79,7 +97,7 @@ class ArticleSwipeTest {
         }
     }
 
-    private fun swipe(root: View, from: Float, to: Float) {
+    private fun drag(root: View, stops: List<Float>, finish: Int = MotionEvent.ACTION_UP, stepMillis: Long = 16L) {
         val downTime = SystemClock.uptimeMillis()
         fun dispatch(action: Int, x: Float) {
             val event = MotionEvent.obtain(downTime, SystemClock.uptimeMillis(), action, x, 216f, 0)
@@ -89,13 +107,15 @@ class ArticleSwipeTest {
                 event.recycle()
             }
         }
-        dispatch(MotionEvent.ACTION_DOWN, from)
-        for (step in 1..12) {
-            settle(root, 1)
-            dispatch(MotionEvent.ACTION_MOVE, from + (to - from) * step / 12)
+        dispatch(MotionEvent.ACTION_DOWN, stops.first())
+        for ((from, to) in stops.zipWithNext()) {
+            for (step in 1..12) {
+                shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(stepMillis))
+                dispatch(MotionEvent.ACTION_MOVE, from + (to - from) * step / 12)
+            }
         }
-        settle(root, 2)
-        dispatch(MotionEvent.ACTION_UP, to)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(stepMillis))
+        dispatch(finish, stops.last())
     }
 
     private fun settle(root: View, frames: Int) {
