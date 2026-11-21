@@ -25,7 +25,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
+import java.io.IOException
+import java.io.InputStream
 
 class QarryApplication : Application() {
     val library: FeedLibrary by lazy {
@@ -110,6 +113,18 @@ class FeedLibrary(private val store: FeedStore, private val client: FeedClient) 
     suspend fun search(url: String): List<FeedDocument> =
         runInterruptible(Dispatchers.IO) { client.discover(url) }
 
+    internal suspend fun importOpml(openInput: () -> InputStream?): FeedImportResult = change {
+        val input = openInput() ?: throw IOException("OPML stream unavailable")
+        val contents = input.use(::readOpml)
+        val added = store.importSubscriptions(contents.feeds)
+        Log.i(FEED_LOG, "Imported feeds=${added.size}")
+        FeedImportResult(
+            added,
+            contents.duplicateCount + contents.feeds.size - added.size,
+            contents.unsupportedCount,
+        )
+    }
+
     suspend fun subscribe(document: FeedDocument, queueId: Long?): Long = change {
         store.subscribe(document, queueId).also {
             Log.i(FEED_LOG, "Subscribed feed=$it entries=${document.articles.size}")
@@ -127,12 +142,25 @@ class FeedLibrary(private val store: FeedStore, private val client: FeedClient) 
     suspend fun removeFeed(id: Long): Unit = change { store.removeFeed(id) }
     suspend fun markRead(id: Long, read: Boolean): Unit = change { store.setRead(id, read) }
 
-    suspend fun refresh(onlyFeed: Long? = null): Unit = coroutineScope {
-        if (!refreshLock.tryLock()) return@coroutineScope
+    suspend fun refresh(onlyFeed: Long? = null) {
+        if (!refreshLock.tryLock()) return
+        try {
+            refreshFeeds(onlyFeed?.let(::setOf))
+        } finally {
+            refreshLock.unlock()
+        }
+    }
+
+    internal suspend fun refreshImported(feedIds: Set<Long>) {
+        if (feedIds.isEmpty()) return
+        refreshLock.withLock { refreshFeeds(feedIds) }
+    }
+
+    private suspend fun refreshFeeds(feedIds: Set<Long>?): Unit = coroutineScope {
         activeRefresh.value = true
         try {
             val feeds = runInterruptible(Dispatchers.IO) { store.subscriptions() }
-                .filter { onlyFeed == null || it.id == onlyFeed }
+                .filter { feedIds == null || it.id in feedIds }
             val connections = Semaphore(4)
             val refreshed = feeds.map { feed ->
                 async {
@@ -155,13 +183,14 @@ class FeedLibrary(private val store: FeedStore, private val client: FeedClient) 
             Log.i(FEED_LOG, "Refresh checked=${feeds.size} succeeded=${refreshed.count { it }}")
         } finally {
             activeRefresh.value = false
-            refreshLock.unlock()
         }
     }
 
     private suspend fun <T> change(block: () -> T): T =
         runInterruptible(Dispatchers.IO) { block().also { changes.update { count -> count + 1 } } }
 }
+
+internal data class FeedImportResult(val feedIds: Set<Long>, val duplicateCount: Int, val unsupportedCount: Int)
 
 fun Context.feedLibrary(): FeedLibrary = (applicationContext as QarryApplication).library
 

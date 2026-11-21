@@ -5,8 +5,10 @@ import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
@@ -24,6 +26,7 @@ import androidx.compose.ui.unit.dp
 import androidx.core.net.toUri
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
+import java.io.IOException
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -81,6 +84,8 @@ private fun QarryScreen(library: FeedLibrary) {
     var queueEditor by remember { mutableStateOf<QueueEditor?>(null) }
     var manageFeed by remember { mutableStateOf<Subscription?>(null) }
     var confirmDelete by remember { mutableStateOf<DeleteTarget?>(null) }
+    var choosingOpml by remember { mutableStateOf(false) }
+    var importing by remember { mutableStateOf(false) }
     val revision by library.revision.collectAsState()
     val refreshing by library.refreshing.collectAsState()
     val snackbars = remember { SnackbarHostState() }
@@ -95,6 +100,33 @@ private fun QarryScreen(library: FeedLibrary) {
                 throw error
             } catch (_: android.database.sqlite.SQLiteException) {
                 snackbars.showSnackbar("端末への保存または読み込みに失敗しました。")
+            }
+        }
+    }
+
+    val importPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        choosingOpml = false
+        if (uri != null) {
+            importing = true
+            change {
+                val message = try {
+                    val imported = library.importOpml { context.contentResolver.openInputStream(uri) }
+                    if (imported.feedIds.isNotEmpty()) change { library.refreshImported(imported.feedIds) }
+                    buildList {
+                        add(if (imported.feedIds.isEmpty()) "新しく登録するフィードはありません" else "${imported.feedIds.size}件を登録しました")
+                        if (imported.duplicateCount > 0) add("重複${imported.duplicateCount}件")
+                        if (imported.unsupportedCount > 0) add("対象外${imported.unsupportedCount}件")
+                    }.joinToString("・")
+                } catch (error: OpmlFormatException) {
+                    error.message.orEmpty()
+                } catch (_: IOException) {
+                    "OPMLファイルを開けませんでした。"
+                } catch (_: SecurityException) {
+                    "OPMLファイルを開けませんでした。"
+                } finally {
+                    importing = false
+                }
+                snackbars.showSnackbar(message)
             }
         }
     }
@@ -240,6 +272,18 @@ private fun QarryScreen(library: FeedLibrary) {
                     )
                     else -> FeedsPage(
                         content, refreshing,
+                        importing = importing,
+                        onImport = {
+                            if (!choosingOpml && !importing) {
+                                choosingOpml = true
+                                try {
+                                    importPicker.launch(arrayOf("*/*"))
+                                } catch (_: ActivityNotFoundException) {
+                                    choosingOpml = false
+                                    change { snackbars.showSnackbar("ファイルを選択できるアプリがありません。") }
+                                }
+                            }
+                        },
                         onAdd = { adding = true },
                         onManage = { manageFeed = it },
                         onRefresh = { feed -> change { library.refresh(feed.id) } },

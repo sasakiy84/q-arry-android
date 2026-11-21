@@ -162,18 +162,30 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
     }
 
     fun subscribe(document: FeedDocument, queueId: Long?): Long = writableDatabase.transaction {
-        val values = ContentValues().apply {
-            put("url", document.url)
-            put("title", document.title)
-        }
-        insertWithOnConflict("feed", null, values, SQLiteDatabase.CONFLICT_IGNORE)
-        val id = rawQuery("SELECT id FROM feed WHERE url = ?", arrayOf(document.url)).use { cursor ->
-            check(cursor.moveToFirst())
-            cursor.getLong(0)
+        val inserted = insertFeed(document.url, document.title)
+        val id = if (inserted != -1L) {
+            inserted
+        } else {
+            rawQuery("SELECT id FROM feed WHERE url = ?", arrayOf(document.url)).use { cursor ->
+                check(cursor.moveToFirst())
+                cursor.getLong(0)
+            }
         }
         if (queueId != null) addMembership(id, queueId)
         saveDocument(id, document, System.currentTimeMillis())
         id
+    }
+
+    internal fun importSubscriptions(feeds: List<OpmlFeed>): Set<Long> = writableDatabase.transaction {
+        feeds.mapNotNull { feed -> insertFeed(feed.url, feed.title).takeIf { it != -1L } }.toSet()
+    }
+
+    private fun SQLiteDatabase.insertFeed(url: String, title: String): Long {
+        val values = ContentValues().apply {
+            put("url", url)
+            put("title", title)
+        }
+        return insertWithOnConflict("feed", null, values, SQLiteDatabase.CONFLICT_IGNORE)
     }
 
     fun recordRefresh(feedId: Long, document: FeedDocument?): Unit = writableDatabase.transaction {

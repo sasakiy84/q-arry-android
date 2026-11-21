@@ -229,6 +229,8 @@ fun QueuesPage(
 fun FeedsPage(
     snapshot: LibrarySnapshot,
     refreshing: Boolean,
+    importing: Boolean,
+    onImport: () -> Unit,
     onAdd: () -> Unit,
     onManage: (Subscription) -> Unit,
     onRefresh: (Subscription) -> Unit,
@@ -236,10 +238,15 @@ fun FeedsPage(
     modifier: Modifier = Modifier,
 ) {
     Column(modifier) {
-        PageHeading("フィード") { Button(onAdd) { Text("追加") } }
+        PageHeading("フィード") {
+            OutlinedButton(onImport, enabled = !importing, contentPadding = PaddingValues(horizontal = 16.dp)) {
+                Text(if (importing) "読込中" else "インポート")
+            }
+            Button(onAdd) { Text("追加") }
+        }
         HorizontalDivider()
         if (snapshot.subscriptions.isEmpty()) {
-            EmptyState("登録済みのフィードがありません", "サイトかRSS・AtomのURLから登録できます。")
+            EmptyState("フィードがありません", "URLを入力するか、OPMLをインポートして追加できます。")
         } else {
             val names = snapshot.queues.associate { it.id to it.name }
             LazyColumn(contentPadding = PaddingValues(bottom = 24.dp)) {
@@ -490,20 +497,25 @@ fun QueueMembershipDialog(
 
 @Composable
 private fun PageHeading(title: String, action: @Composable () -> Unit) {
-    Row(
+    FlowRow(
         Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 7.dp, bottom = 12.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         Text(
             title,
-            Modifier.weight(1f),
+            Modifier.align(Alignment.CenterVertically),
             style = MaterialTheme.typography.headlineMedium,
             fontFamily = FontFamily.Serif,
             maxLines = 2,
             overflow = TextOverflow.Ellipsis,
         )
-        action()
+        Row(
+            Modifier.align(Alignment.CenterVertically),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            action()
+        }
     }
 }
 

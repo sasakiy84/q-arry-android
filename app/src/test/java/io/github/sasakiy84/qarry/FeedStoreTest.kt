@@ -1,6 +1,7 @@
 package io.github.sasakiy84.qarry
 
 import android.app.Application
+import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.*
 import org.junit.Before
@@ -67,6 +68,32 @@ class FeedStoreTest {
         assertEquals("Corrected article", state.articles.single().title)
         assertTrue(state.articles.single().read)
         assertTrue(store.load(null, true, 10).articles.isEmpty())
+    }
+
+    @Test
+    fun importingAnOpmlTwiceKeepsExistingArticlesAndFeedMetadata() = runBlocking {
+        val original = example.copy(etag = "\"current\"")
+        val existingId = store.subscribe(original, null)
+        val library = FeedLibrary(store, FeedClient { error("Import does not require a network connection") })
+        val input = """
+            <opml version="2.0"><body>
+              <outline text="Do not replace" xmlUrl="${original.url}"/>
+              <outline text="新しいフィード" xmlUrl="https://other.example/atom"/>
+            </body></opml>
+        """.trimIndent()
+        val first = library.importOpml { input.byteInputStream() }
+        assertEquals(1, first.feedIds.size)
+        assertEquals(1, first.duplicateCount)
+        assertEquals(FeedImportResult(emptySet(), 2, 0), library.importOpml { input.byteInputStream() })
+
+        val snapshot = store.load(null, false, 10)
+        val existing = snapshot.subscriptions.single { it.id == existingId }
+        assertEquals(original.title, existing.title)
+        assertEquals(original.etag, existing.etag)
+        val imported = snapshot.subscriptions.single { it.id == first.feedIds.single() }
+        assertEquals("新しいフィード", imported.title)
+        assertNull(imported.refreshedAt)
+        assertEquals("First article", snapshot.articles.single().title)
     }
 
     @Test
