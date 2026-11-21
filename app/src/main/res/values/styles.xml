@@ -1,0 +1,10 @@
+<resources>
+    <string name="app_name">Q-arry</string>
+    <color name="launcher_background">#FBFAF6</color>
+    <style name="Theme.Qarry" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowBackground">@color/launcher_background</item>
+        <item name="android:windowSplashScreenBackground">@color/launcher_background</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@mipmap/ic_launcher</item>
+    </style>
+</resources>

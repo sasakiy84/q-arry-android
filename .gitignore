@@ -1,0 +1,9 @@
+/.agents/skills/
+/.gradle/
+/.kotlin/
+/.idea/
+/local.properties
+**/build/
+*.iml
+*.jks
+*.keystore
