@@ -43,13 +43,17 @@ class FeedRequestException(message: String, cause: Throwable? = null) : IOExcept
 class FeedClient(
     private val openConnection: (String) -> HttpURLConnection = { URL(it).openConnection() as HttpURLConnection },
 ) {
-    fun discover(input: String): List<FeedDocument> {
+    fun discover(input: String): List<FeedDocument> = discover(input, preview = false).feeds
+
+    internal fun discoverForRegistration(input: String): FeedDiscovery = discover(input, preview = true)
+
+    private fun discover(input: String, preview: Boolean): FeedDiscovery {
         val value = input.trim()
         if (value.isEmpty()) throw FeedRequestException("URLを入力してください。")
         val initialUrl = webUrl(if (schemePrefix.containsMatchIn(value)) value else "https://$value")
             ?: throw FeedRequestException("HTTPSのURLを入力してください。")
         val page = fetch(initialUrl)
-        parse(page)?.let { return listOf(it) }
+        parse(page)?.let { return FeedDiscovery(feeds = listOf(it)) }
 
         val html = page.parseHtml()
         val advertised = html.select("head link[href][rel]").mapNotNull { link ->
@@ -62,7 +66,7 @@ class FeedClient(
         }
         val candidates = advertised.distinct().take(MAX_ADVERTISED_FEEDS)
         val discovered = candidates.mapNotNull { tryCandidate(it) }.distinctBy { it.url }
-        if (discovered.isNotEmpty()) return discovered
+        if (discovered.isNotEmpty()) return FeedDiscovery(feeds = discovered)
 
         val localPaths = listOf("feed/", "rss.xml", "atom.xml", "index.xml", "feed.xml", "rss")
         val origin = URI(page.url).let { "${it.scheme}://${it.rawAuthority}/" }
@@ -75,10 +79,15 @@ class FeedClient(
         for (path in nearPage + localPaths) {
             val candidate = resolveUrl(origin, path) ?: continue
             if (candidate == page.url || candidate in candidates) continue
-            tryCandidate(candidate)?.let { return listOf(it) }
+            tryCandidate(candidate)?.let { return FeedDiscovery(feeds = listOf(it)) }
         }
-        return extractHtmlFeed(html, page.url)?.let { listOf(it.copy(etag = page.etag, modified = page.modified)) }
-            ?: throw FeedRequestException("フィードまたは記事一覧を見つけられませんでした。")
+        val website = if (preview) {
+            websiteScopes(html, page.url, page.etag, page.modified)?.let { FeedDiscovery(website = it) }
+        } else {
+            extractHtmlFeed(html, page.url)
+                ?.let { FeedDiscovery(feeds = listOf(it.copy(etag = page.etag, modified = page.modified))) }
+        }
+        return website ?: throw FeedRequestException("フィードまたは記事一覧を見つけられませんでした。")
     }
 
     fun refresh(url: String, etag: String?, modified: String?, htmlItemSelector: String? = null): FeedDocument? {

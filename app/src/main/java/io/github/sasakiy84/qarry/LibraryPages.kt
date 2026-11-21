@@ -300,7 +300,7 @@ fun AddFeedPage(
     var url by rememberSaveable { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
     var error by rememberSaveable { mutableStateOf<String?>(null) }
-    var found by remember { mutableStateOf<List<FeedDocument>>(emptyList()) }
+    var found by remember { mutableStateOf(FeedDiscovery()) }
     val scope = rememberCoroutineScope()
     val focus = LocalFocusManager.current
 
@@ -309,7 +309,7 @@ fun AddFeedPage(
         focus.clearFocus()
         busy = true
         error = null
-        found = emptyList()
+        found = FeedDiscovery()
         scope.launch {
             try {
                 found = library.search(url)
@@ -321,29 +321,64 @@ fun AddFeedPage(
         }
     }
 
+    fun save(feed: FeedDocument) {
+        if (busy) return
+        busy = true
+        error = null
+        scope.launch {
+            try {
+                library.subscribe(feed, queueId)
+                onAdded()
+            } catch (_: android.database.sqlite.SQLiteException) {
+                error = "フィードを端末に保存できませんでした。"
+            } finally {
+                busy = false
+            }
+        }
+    }
+
+    found.website?.let { website ->
+        WebsiteScopePage(
+            website = website,
+            busy = busy,
+            alreadySubscribed = website.options.first().feed.url in subscribedUrls,
+            error = error,
+            onChangeUrl = { found = FeedDiscovery(); error = null },
+            onRegister = ::save,
+            modifier = modifier,
+        )
+        return
+    }
+
     LazyColumn(
         modifier, contentPadding = pagePadding, verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
         item {
             OutlinedTextField(
                 value = url,
-                onValueChange = { url = it; error = null; found = emptyList() },
+                onValueChange = { url = it; error = null; found = FeedDiscovery() },
                 modifier = Modifier.fillMaxWidth(),
                 enabled = !busy,
-                label = { Text("サイトまたはフィードのURL") },
+                label = { Text("WebページまたはRSSのURL") },
                 placeholder = { Text("https://example.com") },
+                supportingText = { Text("RSSが見つからない場合は、Webページ内の一覧を探します。") },
                 singleLine = true,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Search),
                 keyboardActions = KeyboardActions(onSearch = { search() }),
             )
         }
-        item { Button(onClick = ::search, enabled = url.isNotBlank() && !busy) { Text("フィードを探す") } }
+        item { Button(onClick = ::search, enabled = url.isNotBlank() && !busy) { Text("登録候補を確認") } }
         if (busy) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
         error?.let { message -> item { Text(message, color = MaterialTheme.colorScheme.error) } }
-        items(found, key = { it.url }) { feed ->
+        items(found.feeds, key = { it.url }) { feed ->
             val existing = feed.url in subscribedUrls
             OutlinedCard(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(
+                        "RSS・Atomフィード",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
                     Text(feed.title, style = MaterialTheme.typography.titleMedium)
                     Text(
                         feed.url,
@@ -352,57 +387,23 @@ fun AddFeedPage(
                         maxLines = 3,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    Text("${feed.articles.size} 件の記事", style = MaterialTheme.typography.labelMedium)
-                    if (feed.htmlItemSelector != null) WebsiteArticlePreview(feed.articles)
+                    Text("${feed.articles.size}件を取得", style = MaterialTheme.typography.labelMedium)
                     Button(
                         enabled = !busy && (!existing || queueId != null),
-                        onClick = {
-                            if (!busy) {
-                                busy = true
-                                scope.launch {
-                                    try {
-                                        library.subscribe(feed, queueId)
-                                        onAdded()
-                                    } catch (_: android.database.sqlite.SQLiteException) {
-                                        error = "フィードを端末に保存できませんでした。"
-                                    } finally {
-                                        busy = false
-                                    }
-                                }
-                            }
-                        },
-                    ) { Text(if (existing && queueId != null) "このキューに追加" else if (existing) "登録済み" else "登録") }
+                        onClick = { save(feed) },
+                    ) {
+                        Text(
+                            when {
+                                existing && queueId != null -> "このキューに追加"
+                                existing -> "登録済み"
+                                else -> "フィードを登録"
+                            },
+                        )
+                    }
                 }
             }
         }
     }
-}
-
-@Composable
-private fun WebsiteArticlePreview(articles: List<FeedArticle>) {
-    Text("Webページから抽出", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
-    for (article in articles.take(3)) {
-        HorizontalDivider()
-        Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
-            article.title?.let {
-                Text(it, style = MaterialTheme.typography.titleSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
-            }
-            article.url?.let { PreviewMetadata(it) }
-            article.body?.let { PreviewMetadata(it) }
-            article.thumbnailUrl?.let { PreviewMetadata("画像 $it") }
-        }
-    }
-}
-
-@Composable
-private fun PreviewMetadata(text: String) {
-    Text(
-        text,
-        style = MaterialTheme.typography.bodySmall,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-        maxLines = 2,
-        overflow = TextOverflow.Ellipsis,
-    )
 }
 
 @Composable

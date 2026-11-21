@@ -110,8 +110,8 @@ class FeedLibrary(private val store: FeedStore, private val client: FeedClient) 
         imageUrl
     }
 
-    suspend fun search(url: String): List<FeedDocument> =
-        runInterruptible(Dispatchers.IO) { client.discover(url) }
+    internal suspend fun search(url: String): FeedDiscovery =
+        runInterruptible(Dispatchers.IO) { client.discoverForRegistration(url) }
 
     internal suspend fun importOpml(openInput: () -> InputStream?): FeedImportResult = change {
         val input = openInput() ?: throw IOException("OPML stream unavailable")

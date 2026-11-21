@@ -7,7 +7,7 @@ import java.net.URI
 private const val MAX_ARTICLES = 500
 private const val MAX_PARENTS_TO_INSPECT = 4_000
 private const val MAX_CARDS_TO_SCORE = 40
-private const val MAIN_CONTENT = "main, [role=main]"
+internal const val MAIN_CONTENT = "main, [role=main]"
 private const val HEADING = "h1, h2, h3, h4, h5, h6"
 private const val NEWS_TITLE = "[itemprop=headline], .title, .headline, .article-title, .entry-title, .post-title"
 private const val DESCRIPTION = "[itemprop=description], .description, .summary, .excerpt, .teaser, .lead"
@@ -18,31 +18,70 @@ private val selectorToken = Regex("[a-zA-Z][a-zA-Z0-9_-]*")
 private val articleHint = Regex("(^|[ _-])(articles?|posts?|news|updates|entries|entry|stories|episodes?)([ _-]|$)", RegexOption.IGNORE_CASE)
 private val genericLinkText = setOf("続きを読む", "もっと読む", "詳しくはこちら", "詳細", "read more", "learn more", "more")
 private val skipLinkText = setOf("前へ", "次へ", "次のページ", "previous", "next")
+private val descriptionColumnNames = setOf("内容", "概要", "説明", "description", "summary", "abstract")
 
 internal fun extractHtmlFeed(document: Document, pageUrl: String, savedSelector: String? = null): FeedDocument? {
     val selector = savedSelector ?: inferItemSelector(document, pageUrl) ?: return null
     val cards = document.select(selector)
-    val articles = cards.asSequence()
-        .filter { it.closest(IGNORE) == null }
-        .mapNotNull { extractCard(it, pageUrl) }
-        .distinctBy { it.key }
-        .take(MAX_ARTICLES)
-        .toList()
+    val rowSelector = when {
+        cards.isEmpty() -> null
+        cards.all { it.normalName() == "table" } -> "$selector > tbody > tr"
+        cards.all { it.normalName() != "table" && it.select("table").size == 1 } -> "$selector table > tbody > tr"
+        else -> null
+    }
+    val tableArticles = rowSelector?.let { document.select(it).feedArticles(pageUrl) }
+        ?.takeIf { it.size > cards.size }
+    val articles = tableArticles ?: cards.feedArticles(pageUrl)
     if (articles.isEmpty()) return null
     return FeedDocument(
         url = pageUrl,
         title = document.title().take(500).ifBlank { URI(pageUrl).host },
         home = pageUrl,
         articles = articles,
-        htmlItemSelector = selector,
+        htmlItemSelector = if (tableArticles != null) rowSelector else selector,
     )
+}
+
+private fun Iterable<Element>.feedArticles(pageUrl: String): List<FeedArticle> =
+    matchedHtmlArticles(this, pageUrl).map { it.second }
+
+internal fun matchedHtmlArticles(cards: Iterable<Element>, pageUrl: String): List<Pair<Element, FeedArticle>> = cards.asSequence()
+    .filter { it.closest(IGNORE) == null }
+    .mapNotNull { card ->
+        if (card.normalName() == "tr" && card.children().none { it.normalName() == "td" }) return@mapNotNull null
+        val article = extractCard(card, pageUrl) ?: return@mapNotNull null
+        val tableDescription = card.descriptionCell()
+        card to if (tableDescription == null) article else article.copy(body = tableDescription.take(2_000))
+    }
+    .distinctBy { it.second.key }
+    .take(MAX_ARTICLES)
+    .toList()
+
+private fun Element.descriptionCell(): String? {
+    if (normalName() != "tr") return null
+    val table = closest("table") ?: return null
+    val header = table.children().firstOrNull { it.normalName() == "thead" }
+        ?.children()?.firstOrNull { it.normalName() == "tr" } ?: return null
+    val column = header.children().indexOfFirst {
+        it.normalName() == "th" && it.text().trim().lowercase() in descriptionColumnNames
+    }
+    return children().getOrNull(column)?.takeIf { it.normalName() == "td" }?.metadataText()
 }
 
 private data class ListCandidate(val selector: String, val score: Int, val urls: Set<String>)
 
 private fun inferItemSelector(document: Document, pageUrl: String): String? {
-    var best: ListCandidate? = null
-    var ambiguous = false
+    val candidates = rankedLists(document, pageUrl)
+    val best = candidates.firstOrNull() ?: return null
+    val ambiguous = candidates.any { it.score == best.score && it.urls.none(best.urls::contains) }
+    return best.selector.takeUnless { ambiguous }
+}
+
+internal fun suggestedItemSelectors(document: Document, pageUrl: String): List<String> =
+    rankedLists(document, pageUrl).distinctBy { it.urls }.take(16).map { it.selector }
+
+private fun rankedLists(document: Document, pageUrl: String): List<ListCandidate> {
+    val candidates = mutableListOf<ListCandidate>()
     val cachedCards = mutableMapOf<Element, FeedArticle?>()
     val parents = document.body().getAllElements().asSequence()
         .filter { it.childrenSize() > 1 && it.closest(IGNORE) == null && it.closest("header") == null }
@@ -80,22 +119,15 @@ private fun inferItemSelector(document: Document, pageUrl: String): String? {
                     selectorToken.matches(token) && cards.all { it.hasClass(token) }
                 }
                 val itemSelector = if (childSelector == tag && commonClass != null) "$tag.$commonClass" else childSelector
-                val candidate = ListCandidate(
+                candidates += ListCandidate(
                     selector = "${parent.cssSelector()} > $itemSelector",
                     score = score,
                     urls = articles.map { it.key }.toSet(),
                 )
-                when {
-                    best == null || score > best.score -> {
-                        best = candidate
-                        ambiguous = false
-                    }
-                    score == best.score && best.urls.intersect(candidate.urls).isEmpty() -> ambiguous = true
-                }
             }
         }
     }
-    return best?.selector?.takeUnless { ambiguous }
+    return candidates.sortedByDescending { it.score }
 }
 
 private fun articleRoute(url: String): String? {

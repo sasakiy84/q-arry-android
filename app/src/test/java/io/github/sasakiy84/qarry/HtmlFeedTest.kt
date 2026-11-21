@@ -36,6 +36,39 @@ class HtmlFeedTest {
     }
 
     @Test
+    fun treatsEachLinkedDataRowAsAnItemAcrossRepeatedTables() {
+        val html = """
+            <main id="updates">
+              <figure class="course-table"><div><table>
+                <thead><tr><th>タイトル</th><th>内容</th><th>時間</th></tr></thead>
+                <tbody>
+                  <tr><td><a href="/courses/1">調べ方</a></td><td>資料を探す手順</td><td>20分</td></tr>
+                  <tr><td><a href="/courses/2">データの活用</a></td><td>データを比較します</td><td>10分</td></tr>
+                </tbody>
+              </table></div></figure>
+              <figure class="course-table"><div><table>
+                <thead><tr><th>タイトル</th><th>内容</th><th>時間</th></tr></thead>
+                <tbody>
+                  <tr><td><a href="/courses/3">資料保存</a></td><td>保存環境を見直します</td><td>30分</td></tr>
+                  <tr><td><a href="/courses/4">デジタル化</a></td><td></td><td>15分</td></tr>
+                </tbody>
+              </table></div></figure>
+            </main>
+        """.trimIndent()
+        val page = Jsoup.parse(html, pageUrl)
+        val found = requireNotNull(extractHtmlFeed(page, pageUrl))
+        assertEquals((1..4).map { "https://museum.example/courses/$it" }, found.articles.map { it.url })
+        assertEquals(listOf("調べ方", "データの活用", "資料保存", "デジタル化"), found.articles.map { it.title })
+        assertEquals(listOf("資料を探す手順", "データを比較します", "保存環境を見直します", null), found.articles.map { it.body })
+        assertEquals(found, extractHtmlFeed(page, pageUrl, "#updates > figure.course-table"))
+
+        val updated = Jsoup.parse(html, pageUrl)
+        updated.select("tbody > tr").dropLast(1).forEach { it.remove() }
+        val refreshed = requireNotNull(extractHtmlFeed(updated, pageUrl, found.htmlItemSelector))
+        assertEquals("デジタル化", refreshed.articles.single().title)
+    }
+
+    @Test
     fun theSavedSelectorStillWorksWhenTheListShrinksToOneArticle() {
         val first = requireNotNull(extractHtmlFeed(fixture("news-cards"), pageUrl))
         val updated = requireNotNull(
