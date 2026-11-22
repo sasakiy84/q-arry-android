@@ -48,7 +48,9 @@ class WebsiteScopesTest {
                 <tr><td><a href="/classes/new">新しい研修</a></td><td>追加分</td></tr>
             """.trimIndent(),
         )
-        val refreshed = requireNotNull(extractHtmlFeed(Jsoup.parse(changed, url), url, narrow.feed.htmlItemSelector))
+        val refreshed = requireNotNull(refreshWebsiteDocument(
+            Jsoup.parse(changed, url), url, requireNotNull(narrow.feed.htmlItemSelector), narrow.feed.htmlWatch,
+        ))
         assertEquals(listOf("科学の調べ方", "技術規格", "新しい研修"), refreshed.articles.map { it.title })
     }
 

@@ -4,6 +4,7 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.junit.Assert.*
 import org.junit.Test
+import java.time.Instant
 
 class HtmlFeedTest {
     private val pageUrl = "https://museum.example/whats-new"
@@ -60,7 +61,7 @@ class HtmlFeedTest {
         assertEquals((1..4).map { "https://museum.example/courses/$it" }, found.articles.map { it.url })
         assertEquals(listOf("調べ方", "データの活用", "資料保存", "デジタル化"), found.articles.map { it.title })
         assertEquals(listOf("資料を探す手順", "データを比較します", "保存環境を見直します", null), found.articles.map { it.body })
-        assertEquals(found, extractHtmlFeed(page, pageUrl, "#updates > figure.course-table"))
+        assertEquals(found.articles, extractHtmlFeed(page, pageUrl, "#updates > figure.course-table")?.articles)
 
         val updated = Jsoup.parse(html, pageUrl)
         updated.select("tbody > tr").dropLast(1).forEach { it.remove() }
@@ -76,6 +77,25 @@ class HtmlFeedTest {
         )
         assertEquals("https://museum.example/archive/news/45", updated.articles.single().url)
         assertEquals(first.htmlItemSelector, updated.htmlItemSelector)
+    }
+
+    @Test
+    fun websiteRowsReadExplicitTimesButDoNotInferADayFromAPublicationMonth() {
+        val html = """
+            <main id="updates"><table>
+              <thead><tr><th>記事</th><th>公開年月</th><th>更新日時</th></tr></thead>
+              <tbody>
+                <tr><td><a href="/news/1">第一回</a></td><td>令和6（2024）年7月</td>
+                    <td><time datetime="2026-11-11T13:25:00+09:00">11月11日</time></td></tr>
+                <tr><td><a href="/news/2">第二回</a></td><td>令和7（2025）年3月</td><td></td></tr>
+              </tbody>
+            </table></main>
+        """.trimIndent()
+        val (dated, undated) = requireNotNull(extractHtmlFeed(Jsoup.parse(html, pageUrl), pageUrl)).articles
+        assertEquals(Instant.parse("2026-11-11T04:25:00Z").toEpochMilli(), dated.updatedAt)
+        assertNull(dated.publishedTime)
+        assertNull(undated.updatedAt)
+        assertNull(undated.publishedTime)
     }
 
     @Test

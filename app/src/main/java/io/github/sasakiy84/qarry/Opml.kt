@@ -16,6 +16,7 @@ internal data class OpmlFeed(
     val title: String,
     val homeUrl: String? = null,
     val htmlItemSelector: String? = null,
+    val htmlWatch: String? = null,
 )
 
 internal data class OpmlContents(
@@ -43,7 +44,8 @@ internal fun readOpml(input: InputStream): OpmlContents {
         if (!website && !outline.hasAttr("xmlUrl")) continue
         val url = httpsUrl(outline.attr(if (website) "url" else "xmlUrl"))
         val selector = if (website) outline.attr(WEBSITE_SELECTOR_ATTRIBUTE).trim().takeIf(::isWebsiteSelector) else null
-        if (url == null || (website && selector == null)) {
+        val watch = if (website && outline.hasAttr(WEBSITE_WATCH_ATTRIBUTE)) outline.attr(WEBSITE_WATCH_ATTRIBUTE) else null
+        if (url == null || (website && selector == null) || (watch != null && decodeWebsiteWatch(watch) == null)) {
             unsupported++
             continue
         }
@@ -53,7 +55,7 @@ internal fun readOpml(input: InputStream): OpmlContents {
         }
         val title = outline.attr("title").trim().ifEmpty { outline.attr("text").trim() }
         val homeUrl = if (website) url else webUrl(outline.attr("htmlUrl"))
-        feeds[url] = OpmlFeed(url, title.ifEmpty { URI(url).host }.take(500), homeUrl, selector)
+        feeds[url] = OpmlFeed(url, title.ifEmpty { URI(url).host }.take(500), homeUrl, selector, watch)
     }
     return OpmlContents(feeds.values.toList(), duplicates, unsupported)
 }
@@ -71,6 +73,7 @@ internal fun encodeOpml(feeds: List<OpmlFeed>): ByteArray {
         val outline = body.appendElement("outline").attr("text", title).attr("title", title)
         if (feed.htmlItemSelector != null) {
             outline.attr("type", "link").attr("url", feed.url).attr(WEBSITE_SELECTOR_ATTRIBUTE, feed.htmlItemSelector)
+            feed.htmlWatch?.let { outline.attr(WEBSITE_WATCH_ATTRIBUTE, it) }
         } else {
             outline.attr("type", "rss").attr("xmlUrl", feed.url)
             feed.homeUrl?.let { outline.attr("htmlUrl", it) }
@@ -96,5 +99,6 @@ private fun isWebsiteSelector(selector: String): Boolean {
 private const val MAX_OPML_BYTES = 2 * 1024 * 1024
 private const val QARRY_OPML_NAMESPACE = "https://github.com/sasakiy84/q-arry-android/opml"
 private const val WEBSITE_SELECTOR_ATTRIBUTE = "qarry:selector"
+private const val WEBSITE_WATCH_ATTRIBUTE = "qarry:watch"
 private val selectorEscapes = Regex("""\\[^\r\n]|:nth-child\([0-9]+\)""")
 private val invalidXmlText = Regex("[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]")

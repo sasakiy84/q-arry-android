@@ -14,9 +14,12 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.painterResource
@@ -54,18 +57,21 @@ internal fun ArticlesPage(
     onArticle: (Article, ArticlePress) -> Unit,
     onDismiss: suspend (Article, ArticleRating?) -> Boolean,
     modifier: Modifier = Modifier,
+    showQueuePicker: Boolean = true,
+    loading: Boolean = false,
 ) {
     val queue = snapshot.queues.firstOrNull { it.id == queueId }
     var confirmMarkAllRead by rememberSaveable { mutableStateOf(false) }
+    val listState = key(queueId, unread) { rememberLazyListState() }
     Column(modifier) {
         PageHeading(queue?.name ?: "記事") {
             FilterChip(selected = unread, onClick = onUnread, label = { Text("未読のみ") })
             TextButton(
                 onClick = { confirmMarkAllRead = true },
-                enabled = !markingRead && (snapshot.hasMore || snapshot.articles.any { !it.read }),
+                enabled = !loading && !markingRead && snapshot.hasUnread,
             ) { Text("すべて既読にする") }
         }
-        if (snapshot.queues.isNotEmpty()) {
+        if (showQueuePicker && snapshot.queues.isNotEmpty()) {
             LazyRow(
                 contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 8.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -84,23 +90,25 @@ internal fun ArticlesPage(
             }
         }
         HorizontalDivider()
-        if (snapshot.articles.isEmpty()) {
+        if (loading) {
+            LoadingIndicator("記事を読み込み中")
+        } else if (snapshot.articles.isEmpty()) {
+            val emptyQueue = queue?.feedCount == 0
             val title = when {
                 snapshot.subscriptions.isEmpty() -> "最初のフィードを登録"
+                emptyQueue -> "このキューにフィードがありません"
                 unread -> "未読の記事はありません"
                 queueId != null -> "このキューに記事がありません"
                 else -> "まだ記事がありません"
             }
             EmptyState(
                 title = title,
-                description = if (queueId != null && !unread && snapshot.subscriptions.isNotEmpty()) {
-                    "フィード画面から、このキューにフィードを追加できます。"
-                } else null,
-                action = if (snapshot.subscriptions.isEmpty()) onAdd else null,
+                description = null,
+                action = if (snapshot.subscriptions.isEmpty() || emptyQueue) onAdd else null,
                 actionLabel = "フィードを追加",
             )
         } else {
-            LazyColumn(modifier = Modifier.weight(1f), contentPadding = PaddingValues(bottom = 24.dp)) {
+            LazyColumn(state = listState, modifier = Modifier.weight(1f), contentPadding = PaddingValues(bottom = 24.dp)) {
                 articleCards(snapshot.articles, onArticle, onDismiss)
                 if (snapshot.hasMore) moreArticles(onMore)
             }
@@ -118,6 +126,47 @@ internal fun ArticlesPage(
                 }) { Text("既読にする") }
             },
             dismissButton = { TextButton(onClick = { confirmMarkAllRead = false }) { Text("キャンセル") } },
+        )
+    }
+}
+
+@Composable
+internal fun QueueArticlesPage(
+    library: FeedLibrary,
+    queueId: Long,
+    revision: Int,
+    markingRead: Boolean,
+    onMarkAllRead: () -> Unit,
+    onAdd: () -> Unit,
+    onArticle: (Article, ArticlePress) -> Unit,
+    onDismiss: suspend (Article, ArticleRating?) -> Boolean,
+    modifier: Modifier = Modifier,
+) {
+    var unread by rememberSaveable { mutableStateOf(true) }
+    var limit by rememberSaveable { mutableIntStateOf(75) }
+    var snapshot by remember { mutableStateOf<LibrarySnapshot?>(null) }
+    var loadedUnread by remember { mutableStateOf<Boolean?>(null) }
+    var failed by remember { mutableStateOf(false) }
+    var attempt by remember { mutableIntStateOf(0) }
+    LaunchedEffect(queueId, unread, limit, revision, attempt) {
+        failed = false
+        val requestedUnread = unread
+        try {
+            snapshot = library.load(queueId, requestedUnread, limit)
+            loadedUnread = requestedUnread
+        } catch (_: android.database.sqlite.SQLiteException) {
+            failed = true
+        }
+    }
+    val content = snapshot
+    when {
+        failed -> EmptyState("記事を読み込めませんでした", null, { attempt++ }, "再試行")
+        content == null -> LoadingIndicator("キューの記事を読み込み中")
+        else -> ArticlesPage(
+            content, queueId, unread, markingRead,
+            onQueue = {}, onUnread = { unread = !unread; limit = 75 }, onMarkAllRead = onMarkAllRead,
+            onAdd = onAdd, onMore = { limit += 75 }, onArticle = onArticle, onDismiss = onDismiss,
+            modifier = modifier, showQueuePicker = false, loading = unread != loadedUnread,
         )
     }
 }
@@ -149,9 +198,9 @@ fun ArticlePage(
                 style = MaterialTheme.typography.headlineSmall,
                 fontWeight = FontWeight.SemiBold,
             )
-            article.published?.let {
+            article.timestampLabel(metadata)?.let { date ->
                 Spacer(Modifier.height(8.dp))
-                Text(entryDate(it), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(date, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
         item {
@@ -289,7 +338,7 @@ internal fun FeedsPage(
             EmptyState("条件に合うフィードはありません", null)
         } else {
             val names = snapshot.queues.associate { it.id to it.name }
-            val listState = key(order) { rememberLazyListState() }
+            val listState = key(order, unassignedOnly, favoritesOnly) { rememberLazyListState() }
             LazyColumn(state = listState, contentPadding = PaddingValues(bottom = 24.dp)) {
                 items(feeds, key = { it.id }) { feed ->
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -367,36 +416,47 @@ fun AddFeedPage(
     library: FeedLibrary,
     queueId: Long?,
     subscribedUrls: Set<String>,
+    saving: Boolean,
+    onSavingChange: (Boolean) -> Unit,
     onAdded: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var url by rememberSaveable { mutableStateOf("") }
-    var busy by remember { mutableStateOf(false) }
+    var searchedUrl by rememberSaveable { mutableStateOf<String?>(null) }
+    var attempt by remember { mutableIntStateOf(0) }
+    var searching by remember { mutableStateOf(searchedUrl != null) }
     var error by rememberSaveable { mutableStateOf<String?>(null) }
     var found by remember { mutableStateOf(FeedDiscovery()) }
     val scope = rememberCoroutineScope()
     val focus = LocalFocusManager.current
+    val busy = searching || saving
 
     fun search() {
         if (url.isBlank() || busy) return
         focus.clearFocus()
-        busy = true
+        searching = true
         error = null
         found = FeedDiscovery()
-        scope.launch {
-            try {
-                found = library.search(url)
-            } catch (failure: FeedRequestException) {
-                error = failure.message
-            } finally {
-                busy = false
-            }
+        searchedUrl = url.trim()
+        attempt++
+    }
+
+    LaunchedEffect(searchedUrl, attempt) {
+        val address = searchedUrl ?: return@LaunchedEffect
+        searching = true
+        error = null
+        try {
+            found = library.search(address)
+        } catch (failure: FeedRequestException) {
+            error = failure.message
+        } finally {
+            searching = false
         }
     }
 
     fun save(feed: FeedDocument) {
         if (busy) return
-        busy = true
+        onSavingChange(true)
         error = null
         scope.launch {
             try {
@@ -405,7 +465,7 @@ fun AddFeedPage(
             } catch (_: android.database.sqlite.SQLiteException) {
                 error = "フィードを端末に保存できませんでした。"
             } finally {
-                busy = false
+                onSavingChange(false)
             }
         }
     }
@@ -416,7 +476,7 @@ fun AddFeedPage(
             busy = busy,
             alreadySubscribed = website.options.first().feed.url in subscribedUrls,
             error = error,
-            onChangeUrl = { found = FeedDiscovery(); error = null },
+            onChangeUrl = { searchedUrl = null; found = FeedDiscovery(); error = null },
             onRegister = ::save,
             modifier = modifier,
         )
@@ -429,7 +489,7 @@ fun AddFeedPage(
         item {
             OutlinedTextField(
                 value = url,
-                onValueChange = { url = it; error = null; found = FeedDiscovery() },
+                onValueChange = { url = it; searchedUrl = null; error = null; found = FeedDiscovery() },
                 modifier = Modifier.fillMaxWidth(),
                 enabled = !busy,
                 label = { Text("WebページまたはRSSのURL") },
@@ -487,6 +547,7 @@ fun QueueNameDialog(editor: QueueEditor, onDismiss: () -> Unit, onSave: suspend 
     var failure by rememberSaveable { mutableStateOf<String?>(null) }
     var saving by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
+    val focus = remember { FocusRequester() }
     fun save() {
         if (name.isBlank() || saving) return
         saving = true
@@ -503,16 +564,18 @@ fun QueueNameDialog(editor: QueueEditor, onDismiss: () -> Unit, onSave: suspend 
         onDismissRequest = { if (!saving) onDismiss() },
         title = { Text(if (editor.id == null) "キューを作成" else "キュー名を変更") },
         text = {
-            Column {
+            Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) {
                 OutlinedTextField(
                     value = name,
-                    onValueChange = { if (it.length <= 80) { name = it; failure = null } },
+                    onValueChange = { name = it.take(80); failure = null },
+                    modifier = Modifier.fillMaxWidth().focusRequester(focus),
                     label = { Text("キュー名") },
                     enabled = !saving,
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
                     keyboardActions = KeyboardActions(onDone = { save() }),
                 )
+                LaunchedEffect(focus) { focus.requestFocus() }
                 failure?.let { Text(it, Modifier.announceStatus(), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
             }
         },
@@ -520,6 +583,14 @@ fun QueueNameDialog(editor: QueueEditor, onDismiss: () -> Unit, onSave: suspend 
         dismissButton = { TextButton(onDismiss, enabled = !saving) { Text("キャンセル") } },
     )
 }
+
+private val selectedQueuesSaver = listSaver<Set<Long>, Long>(save = { it.toList() }, restore = { it.toSet() })
+private val queueFiltersSaver = listSaver<Map<Long, KeywordFilter>, String>(
+    save = { filters -> filters.flatMap { (id, rule) -> listOf(id.toString(), rule.mode.name, rule.keywords.joinToString("\n")) } },
+    restore = { values -> values.chunked(3).associate { (id, mode, terms) ->
+        id.toLong() to KeywordFilter(KeywordFilterMode.valueOf(mode), terms.lines())
+    } },
+)
 
 @Composable
 internal fun QueueMembershipDialog(
@@ -529,23 +600,24 @@ internal fun QueueMembershipDialog(
     onCreateQueue: () -> Unit,
     onSave: suspend (Set<Long>, Map<Long, KeywordFilter>) -> String?,
 ) {
-    var selected by remember(feed.id) { mutableStateOf(feed.queueIds) }
-    var filters by remember(feed.id) { mutableStateOf(feed.queueKeywordFilters) }
-    var editingQueue by remember(feed.id) { mutableStateOf<FeedQueue?>(null) }
+    var selected by rememberSaveable(feed.id, stateSaver = selectedQueuesSaver) { mutableStateOf(feed.queueIds) }
+    var filters by rememberSaveable(feed.id, stateSaver = queueFiltersSaver) { mutableStateOf(feed.queueKeywordFilters) }
+    var editingQueueId by rememberSaveable(feed.id) { mutableStateOf<Long?>(null) }
     var saving by remember(feed.id) { mutableStateOf(false) }
     var failure by remember(feed.id) { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
-    val selectedFilters = filters.filterKeys { it in selected }
+    val availableSelection = selected.intersect(queues.map { it.id }.toSet())
+    val selectedFilters = filters.filterKeys { it in availableSelection }
 
-    editingQueue?.let { queue ->
+    queues.firstOrNull { it.id == editingQueueId }?.let { queue ->
         KeywordFilterDialog(
             scopeLabel = queue.name,
             initial = filters[queue.id],
             replaceMessage = if (feed.keywordFilter != null) "キュー設定を保存すると、フィード全体のフィルターを解除します。" else null,
-            onDismiss = { editingQueue = null },
+            onDismiss = { editingQueueId = null },
             onSave = { rule ->
                 filters = if (rule == null) filters - queue.id else filters + (queue.id to rule)
-                editingQueue = null
+                editingQueueId = null
                 null
             },
         )
@@ -556,44 +628,47 @@ internal fun QueueMembershipDialog(
         onDismissRequest = { if (!saving) onDismiss() },
         title = { Text("キューを設定") },
         text = {
-            Column {
-                Text(feed.title, style = MaterialTheme.typography.titleSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                Spacer(Modifier.height(8.dp))
+            LazyColumn(Modifier.heightIn(max = 360.dp)) {
+                item {
+                    Text(feed.title, style = MaterialTheme.typography.titleSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    Spacer(Modifier.height(8.dp))
+                }
                 if (queues.isEmpty()) {
-                    Text("キューがありません。")
+                    item { Text("キューがありません。") }
                 } else {
-                    LazyColumn(Modifier.heightIn(max = 300.dp)) {
-                        items(queues, key = { it.id }) { queue ->
-                            val checked = queue.id in selected
-                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                                Row(
-                                    Modifier.weight(1f).heightIn(min = 48.dp)
-                                        .toggleable(checked, enabled = !saving, role = Role.Checkbox) { value ->
-                                            selected = if (value) selected + queue.id else selected - queue.id
-                                        },
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                ) {
-                                    Checkbox(checked, onCheckedChange = null, enabled = !saving)
-                                    Text(queue.name)
-                                }
-                                if (checked) {
-                                    TextButton(onClick = { editingQueue = queue }, enabled = !saving) {
-                                        Text(filters[queue.id]?.summary ?: "フィルター")
-                                    }
+                    item { TextButton(onCreateQueue, enabled = !saving) { Text("キューを作成") } }
+                    if (feed.keywordFilter != null && selectedFilters.isNotEmpty()) {
+                        item { Text(
+                            "保存すると、フィード全体のフィルターを解除します。",
+                            Modifier.announceStatus(),
+                            style = MaterialTheme.typography.bodySmall,
+                        ) }
+                    }
+                    items(queues, key = { it.id }) { queue ->
+                        val checked = queue.id in selected
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Row(
+                                Modifier.weight(1f).heightIn(min = 48.dp)
+                                    .toggleable(checked, enabled = !saving, role = Role.Checkbox) { value ->
+                                        selected = if (value) selected + queue.id else selected - queue.id
+                                    },
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                Checkbox(checked, onCheckedChange = null, enabled = !saving)
+                                Text(queue.name)
+                            }
+                            if (checked) {
+                                TextButton(onClick = { editingQueueId = queue.id }, enabled = !saving) {
+                                    Text(filters[queue.id]?.summary ?: "フィルター")
                                 }
                             }
                         }
                     }
-                    if (feed.keywordFilter != null && selectedFilters.isNotEmpty()) {
-                        Text(
-                            "保存すると、フィード全体のフィルターを解除します。",
-                            Modifier.announceStatus(),
-                            style = MaterialTheme.typography.bodySmall,
-                        )
-                    }
                 }
-                failure?.let { Text(it, Modifier.announceStatus(), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+                failure?.let { message ->
+                    item { Text(message, Modifier.announceStatus(), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+                }
             }
         },
         confirmButton = {
@@ -605,7 +680,7 @@ internal fun QueueMembershipDialog(
                     saving = true
                     scope.launch {
                         try {
-                            failure = onSave(selected, selectedFilters)
+                            failure = onSave(availableSelection, selectedFilters)
                         } finally {
                             saving = false
                         }
@@ -647,9 +722,10 @@ internal fun EmptyState(
     description: String?,
     action: (() -> Unit)? = null,
     actionLabel: String = "",
+    scrollable: Boolean = true,
 ) {
     Column(
-        Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(24.dp),
+        (if (scrollable) Modifier.verticalScroll(rememberScrollState()) else Modifier).fillMaxWidth().padding(24.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Text(title, style = MaterialTheme.typography.titleLarge)
@@ -674,8 +750,29 @@ private fun RowMenu(description: String, actions: List<Pair<String, () -> Unit>>
 }
 
 private val entryDateFormat = DateTimeFormatter.ofPattern("yyyy/M/d")
+private val articleTimestampFormat = DateTimeFormatter.ofPattern("yyyy/M/d HH:mm")
 
 internal fun entryDate(epoch: Long): String =
     entryDateFormat.format(Instant.ofEpochMilli(epoch).atZone(ZoneId.systemDefault()))
+
+internal fun Article.timestampLabel(metadata: ArticleMetadata?): String? = articleTimestampLabel(
+    metadata?.updatedAt ?: updatedAt, metadata?.publishedTime ?: publishedTime, changeDetectedAt, discoveredAt,
+)
+
+internal fun articleTimestampLabel(
+    updatedAt: Long?,
+    publishedTime: Long?,
+    changeDetectedAt: Long? = null,
+    discoveredAt: Long?,
+): String? {
+    val (label, time) = when {
+        updatedAt != null -> "更新" to updatedAt
+        changeDetectedAt != null -> "更新検知" to changeDetectedAt
+        publishedTime != null -> "公開" to publishedTime
+        discoveredAt != null -> "更新検知" to discoveredAt
+        else -> return null
+    }
+    return "$label ${articleTimestampFormat.format(Instant.ofEpochMilli(time).atZone(ZoneId.systemDefault()))}"
+}
 
 private fun hostLabel(url: String): String = java.net.URI(url).host ?: url

@@ -58,7 +58,11 @@ class OpmlTest {
     fun exportedOpmlIsValidXmlAndPreservesJapaneseNamesUrlsAndWebsiteScopes() {
         val subscriptions = listOf(
             OpmlFeed("https://example.com/feed?id=1&lang=ja", "研究 & ニュース <新着> \"RSS\"", "https://example.com/"),
-            OpmlFeed("https://example.com/news", "Webページの監視", "https://example.com/news", "main > article:nth-child(2)"),
+            OpmlFeed(
+                "https://example.com/news", "Webページの監視", "https://example.com/news", "main article",
+                encodeWebsiteWatch(WebsiteWatch(null, null, true, setOf("example.com/news/"), setOf("sample"))),
+            ),
+            OpmlFeed("https://example.com/old", "旧バージョンで登録したWebページ", "https://example.com/old", "main > article:nth-child(2)"),
         )
         val bytes = encodeOpml(subscriptions)
         val xml = DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(bytes.inputStream())

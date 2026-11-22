@@ -32,14 +32,21 @@ internal fun websiteScopes(
     val options = mutableListOf<WebsiteScope>()
     val keys = mutableSetOf<Set<String>>()
     val markers = mutableMapOf<Element, Int>()
+    val observedAt = System.currentTimeMillis()
     document.select("[$SCOPE_MARKER]").removeAttr(SCOPE_MARKER)
 
-    fun add(label: String, feed: FeedDocument?) {
-        if (feed == null || options.size >= MAX_OPTIONS || !keys.add(feed.articles.map { it.key }.toSet())) return
+    fun add(label: String, feed: FeedDocument?, firstOnly: Boolean = false) {
+        if (feed == null || options.size >= MAX_OPTIONS) return
         val selected = matchedHtmlArticles(document.select(requireNotNull(feed.htmlItemSelector)), url)
-        val ids = selected.map { (node, _) -> markers.getOrPut(node) { markers.size } }
+        val displayed = if (firstOnly) selected.take(1) else selected
+        val articles = displayed.map { it.second }
+        if (articles.isEmpty() || !keys.add(articles.map { it.key }.toSet())) return
+        val ids = displayed.map { (node, _) -> markers.getOrPut(node) { markers.size } }
         val displayLabel = if (options.any { it.label == label }) "$label（${options.size + 1}）" else label
-        options.add(WebsiteScope(displayLabel, feed.copy(etag = etag, modified = modified), ids))
+        val watch = encodeWebsiteWatch(watchFor(selected, firstOnly))
+        options.add(WebsiteScope(displayLabel, feed.copy(
+            articles = articles, etag = etag, modified = modified, htmlWatch = watch, observedAt = observedAt,
+        ), ids))
     }
 
     val groups = rows.groupBy { row ->
@@ -68,12 +75,7 @@ internal fun websiteScopes(
         add(firstItem.sectionLabel() ?: "候補 ${options.size + 1}", feed)
     }
     if (options.size == 1 && rows.size > 1) {
-        val first = rows.first()
-        val parent = first.parent()
-        if (parent != null) {
-            val selector = "${parent.cssSelector()} > ${first.normalName()}:nth-child(${first.elementSiblingIndex() + 1})"
-            add("先頭の1件", extractHtmlFeed(document, url, selector))
-        }
+        add("先頭の1件", primary, firstOnly = true)
     }
 
     for ((element, id) in markers) element.attr(SCOPE_MARKER, id.toString())
@@ -83,16 +85,7 @@ internal fun websiteScopes(
 private fun Element.sectionLabel(): String? {
     val caption = selectFirst("caption")?.text()?.takeIf(String::isNotBlank)
     if (caption != null) return caption.take(70)
-    var node: Element? = this
-    while (node != null && !node.`is`(MAIN_CONTENT) && node.normalName() != "body") {
-        var preceding = node.previousElementSibling()
-        while (preceding != null) {
-            if (preceding.normalName() in SECTION_HEADINGS) return preceding.text().take(70).takeIf(String::isNotBlank)
-            preceding = preceding.previousElementSibling()
-        }
-        node = node.parent()
-    }
-    return null
+    return precedingSectionHeading()?.text()?.take(70)?.takeIf(String::isNotBlank)
 }
 
 private fun renderPreview(document: Document, highlighted: Set<Element>): String {
@@ -128,4 +121,3 @@ private fun renderPreview(document: Document, highlighted: Set<Element>): String
 
 internal const val SCOPE_MARKER = "data-qarry-item"
 private const val MAX_OPTIONS = 12
-private val SECTION_HEADINGS = setOf("h1", "h2", "h3", "h4", "h5", "h6")

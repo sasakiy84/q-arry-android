@@ -30,6 +30,8 @@ class FeedClientTest {
         assertEquals("https://publisher.example/posts/1", article.url)
         assertEquals("本文", article.body)
         assertEquals(Instant.parse("2026-11-11T03:00:00Z").toEpochMilli(), article.published)
+        assertEquals(article.published, article.publishedTime)
+        assertNull(article.updatedAt)
         val revision = parseFeed(xml.replace("<title>記事</title>", "<title>訂正</title>").toByteArray(), feed.url)
         assertEquals(article.key, revision?.articles?.single()?.key)
     }
@@ -51,6 +53,21 @@ class FeedClientTest {
         assertEquals("https://publisher.example/blog/posts/1", article.url)
         assertEquals("Summary", article.body)
         assertEquals(Instant.parse("2026-11-11T04:25:00Z").toEpochMilli(), article.published)
+        assertEquals(article.published, article.updatedAt)
+        assertNull(article.publishedTime)
+    }
+
+    @Test
+    fun publicationDateWithoutATimeDoesNotBecomeAMidnightTimestamp() {
+        val xml = """
+            <feed xmlns="http://www.w3.org/2005/Atom"><title>Atom</title>
+              <entry><id>urn:entry:1</id><title>Article</title><published>2026-11-11</published>
+                <updated>2026-11-11T13:25:00+09:00</updated></entry>
+            </feed>
+        """.trimIndent()
+        val article = requireNotNull(parseFeed(xml.toByteArray(), "https://publisher.example/feed")).articles.single()
+        assertNull(article.publishedTime)
+        assertEquals(Instant.parse("2026-11-11T04:25:00Z").toEpochMilli(), article.updatedAt)
     }
 
     @Test
@@ -103,12 +120,17 @@ class FeedClientTest {
                     <meta property="og:image" content="https://publisher.example/general.jpg">
                     <meta property="og:image:secure_url" content="images/story.jpg">
                     <meta name="twitter:image" content="https://publisher.example/share.jpg">
+                    <meta property="article:modified_time" content="2026-11-11T13:25:00+09:00">
+                    <meta property="article:published_time" content="2026-11-10T11:00:00+09:00">
                 </head>""".trimIndent() + " ".repeat(140_000),
                 "text/html; charset=UTF-8",
             )
         }
         assertEquals(
-            ArticleMetadata("記事 & ニュース", "記事ページの説明", "https://publisher.example/posts/images/story.jpg"),
+            ArticleMetadata(
+                "記事 & ニュース", "記事ページの説明", "https://publisher.example/posts/images/story.jpg",
+                Instant.parse("2026-11-11T04:25:00Z").toEpochMilli(), Instant.parse("2026-11-10T02:00:00Z").toEpochMilli(),
+            ),
             fixtureClient(address).articleMetadata("https://publisher.example/old"),
         )
     }

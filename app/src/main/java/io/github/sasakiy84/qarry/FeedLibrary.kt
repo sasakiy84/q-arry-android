@@ -123,6 +123,12 @@ class FeedLibrary(private val store: FeedStore, private val client: FeedClient) 
     internal suspend fun search(url: String): FeedDiscovery =
         runInterruptible(Dispatchers.IO) { client.discoverForRegistration(url) }
 
+    internal suspend fun inspectWebsite(url: String): WebsiteScopes =
+        runInterruptible(Dispatchers.IO) { client.inspectWebsite(url) }
+
+    internal suspend fun updateWebsiteScope(feedId: Long, document: FeedDocument): Boolean =
+        change { store.updateWebsiteScope(feedId, document) }
+
     internal suspend fun importOpml(openInput: () -> InputStream?): FeedImportResult = change {
         val input = openInput() ?: throw IOException("OPML stream unavailable")
         val contents = input.use(::readOpml)
@@ -136,7 +142,7 @@ class FeedLibrary(private val store: FeedStore, private val client: FeedClient) 
     }
 
     internal suspend fun exportOpml(openOutput: () -> OutputStream?): Int = runInterruptible(Dispatchers.IO) {
-        val feeds = store.subscriptions().map { OpmlFeed(it.url, it.title, it.homeUrl, it.htmlItemSelector) }
+        val feeds = store.subscriptions().map { OpmlFeed(it.url, it.title, it.homeUrl, it.htmlItemSelector, it.htmlWatch) }
         val document = encodeOpml(feeds)
         val output = openOutput() ?: throw IOException("OPML output stream unavailable")
         output.use { it.write(document) }
@@ -192,12 +198,16 @@ class FeedLibrary(private val store: FeedStore, private val client: FeedClient) 
                     connections.withPermit {
                         runInterruptible(Dispatchers.IO) {
                             try {
-                                val document = client.refresh(feed.url, feed.etag, feed.modified, feed.htmlItemSelector)
-                                store.recordRefresh(feed.id, document)
-                                true
+                                val oldKeys = if (feed.htmlWatch == null && feed.htmlItemSelector?.contains(":nth-child(") == true) {
+                                    store.recentWebsiteKeys(feed.id)
+                                } else emptySet()
+                                val document = client.refresh(
+                                    feed.url, feed.etag, feed.modified, feed.htmlItemSelector, feed.htmlWatch, oldKeys,
+                                )
+                                store.recordRefresh(feed.id, document, expected = feed)
                             } catch (error: FeedRequestException) {
                                 if (Thread.currentThread().isInterrupted) throw InterruptedException()
-                                store.recordFailure(feed.id, error.message.orEmpty())
+                                store.recordRefresh(feed.id, null, expected = feed, error = error.message.orEmpty())
                                 Log.w(FEED_LOG, "Refresh failed feed=${feed.id} ${error.message}")
                                 false
                             }

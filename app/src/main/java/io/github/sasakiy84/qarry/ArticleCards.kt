@@ -180,9 +180,10 @@ private fun ArticleCardContent(
     val title = metadata?.title ?: article.displayTitle
     val titleLines = if (largeText) 2 else 1
     val height = with(LocalDensity.current) {
-        typography.labelMedium.lineHeight.toDp() + typography.titleMedium.lineHeight.toDp() * titleLines +
+        typography.labelMedium.lineHeight.toDp() + typography.labelSmall.lineHeight.toDp() +
+            typography.titleMedium.lineHeight.toDp() * titleLines +
             typography.bodySmall.lineHeight.toDp() * 2 + typography.bodySmall.fontSize.toDp()
-    } + 32.dp
+    } + 36.dp
     Row(
         modifier.fillMaxWidth().heightIn(min = height).background(MaterialTheme.colorScheme.surface)
             .articleOpenActions(article.url, onOpen)
@@ -212,7 +213,7 @@ private fun ArticleCardContent(
                     article.rating != null -> article.rating.label
                     history -> article.viewedAt?.let(::entryDate)
                     !article.read -> "未読"
-                    else -> article.published?.let(::entryDate)
+                    else -> null
                 }
                 status?.let {
                     Text(
@@ -226,6 +227,9 @@ private fun ArticleCardContent(
                 fontWeight = if (article.read) FontWeight.Medium else FontWeight.SemiBold,
                 maxLines = titleLines, overflow = TextOverflow.Ellipsis,
             )
+            article.timestampLabel(metadata)?.let { date ->
+                Text(date, style = typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+            }
             (metadata?.description ?: article.body)?.let { description ->
                 Text(
                     description.trim(), style = typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,

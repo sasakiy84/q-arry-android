@@ -39,7 +39,7 @@ class ArticleNavigationTest {
                 List(40) { index ->
                     FeedArticle(
                         index.toString(), if (index == 14) title else "記事 $index",
-                        if (index == 14) url else null, "記事の説明", (40 - index) * 1000L,
+                        if (index == 14) url else null, "記事の説明", if (index == 0) null else (40 - index) * 1000L,
                     )
                 },
             ), null)
@@ -69,6 +69,7 @@ class ArticleNavigationTest {
                 }
 
                 waitFor(root, "未読の記事") { root.nodes().any { it.text().contains("記事 0") } }
+                assertTrue(root.nodes().any { it.text().contains("更新検知 ") })
                 assertTrue(root.nodes().none { it.text().contains("記事 1") })
                 root.click { it == "すべて既読にする" }
                 waitFor(root, "すべて既読にする確認ダイアログ") { ShadowDialog.getLatestDialog()?.isShowing == true }
@@ -81,6 +82,7 @@ class ArticleNavigationTest {
                 val articlesPosition = scrollTo(14, title)
                 root.click { it.contains(title) }
                 waitFor(root, "記事詳細") { root.nodes().any { it.text() == "共有" } }
+                assertTrue(root.nodes().any { it.text().startsWith("公開 ") })
                 root.click { it == "サンプルフィード" }
                 waitFor(root, "フィード詳細") { root.nodes().any { it.text() == "記事一覧" } }
                 val feedPosition = scrollTo(15, title)

@@ -27,6 +27,8 @@ data class FeedDocument(
     val etag: String? = null,
     val modified: String? = null,
     val htmlItemSelector: String? = null,
+    val htmlWatch: String? = null,
+    val observedAt: Long? = null,
 )
 
 data class FeedArticle(
@@ -36,9 +38,17 @@ data class FeedArticle(
     val body: String?,
     val published: Long?,
     val thumbnailUrl: String? = null,
+    val updatedAt: Long? = null,
+    val publishedTime: Long? = published,
 )
 
-internal data class ArticleMetadata(val title: String?, val description: String?, val imageUrl: String?)
+internal data class ArticleMetadata(
+    val title: String?,
+    val description: String?,
+    val imageUrl: String?,
+    val updatedAt: Long? = null,
+    val publishedTime: Long? = null,
+)
 
 class FeedRequestException(message: String, cause: Throwable? = null) : IOException(message, cause)
 
@@ -48,6 +58,12 @@ class FeedClient(
     fun discover(input: String): List<FeedDocument> = discover(input, preview = false).feeds
 
     internal fun discoverForRegistration(input: String): FeedDiscovery = discover(input, preview = true)
+
+    internal fun inspectWebsite(url: String): WebsiteScopes {
+        val page = fetch(url)
+        return websiteScopes(page.parseHtml(), page.url, page.etag, page.modified)
+            ?: throw FeedRequestException("選び直せる記事一覧が見つかりませんでした。")
+    }
 
     private fun discover(input: String, preview: Boolean): FeedDiscovery {
         val value = input.trim()
@@ -86,19 +102,32 @@ class FeedClient(
         val website = if (preview) {
             websiteScopes(html, page.url, page.etag, page.modified)?.let { FeedDiscovery(website = it) }
         } else {
-            extractHtmlFeed(html, page.url)
-                ?.let { FeedDiscovery(feeds = listOf(it.copy(etag = page.etag, modified = page.modified))) }
+            extractHtmlFeed(html, page.url)?.let { feed ->
+                val matches = matchedHtmlArticles(html.select(requireNotNull(feed.htmlItemSelector)), page.url)
+                val watch = encodeWebsiteWatch(watchFor(matches))
+                FeedDiscovery(feeds = listOf(feed.copy(
+                    etag = page.etag, modified = page.modified, htmlWatch = watch, observedAt = System.currentTimeMillis(),
+                )))
+            }
         }
         return website ?: throw FeedRequestException("フィードまたは記事一覧を見つけられませんでした。")
     }
 
-    fun refresh(url: String, etag: String?, modified: String?, htmlItemSelector: String? = null): FeedDocument? {
-        val response = fetch(url, etag, modified)
+    fun refresh(
+        url: String,
+        etag: String?,
+        modified: String?,
+        htmlItemSelector: String? = null,
+        htmlWatch: String? = null,
+        previousKeys: Set<String> = emptySet(),
+    ): FeedDocument? {
+        val needsVerification = htmlWatch == null && htmlItemSelector?.contains(":nth-child(") == true
+        val response = if (needsVerification) fetch(url) else fetch(url, etag, modified)
         if (response.notModified) return null
         if (htmlItemSelector != null) {
-            return extractHtmlFeed(response.parseHtml(), response.url, htmlItemSelector)
-                ?.copy(etag = response.etag, modified = response.modified)
-                ?: throw FeedRequestException("登録時に選ばれた記事一覧を取得できませんでした。")
+            return refreshWebsiteDocument(response.parseHtml(), response.url, htmlItemSelector, htmlWatch, previousKeys)
+                ?.copy(etag = response.etag, modified = response.modified, observedAt = System.currentTimeMillis())
+                ?: throw FeedRequestException(WEBSITE_SCOPE_CHANGED)
         }
         return parse(response) ?: throw FeedRequestException("RSS・Atomとして読み込めませんでした。")
     }
@@ -107,7 +136,7 @@ class FeedClient(
         val articleUrl = httpsUrl(url) ?: return null
         val head = fetch(articleUrl, articleMetadata = true).parseHtml().head()
         val metadata = head.select("meta[content]")
-        fun firstValue(keys: List<String>, value: (Element) -> String?): String? = keys.firstNotNullOfOrNull { key ->
+        fun <T : Any> firstValue(keys: List<String>, value: (Element) -> T?): T? = keys.firstNotNullOfOrNull { key ->
             metadata.firstNotNullOfOrNull { meta ->
                 if (meta.attr("property").equals(key, true) || meta.attr("name").equals(key, true)) value(meta) else null
             }
@@ -121,8 +150,12 @@ class FeedClient(
             meta.attr("content").takeIf(String::isNotBlank)?.let { httpsUrl(meta.absUrl("content")) }
         } ?: head.select("link[rel=image_src][href]")
             .firstNotNullOfOrNull { httpsUrl(it.absUrl("href")) }
-        return if (title != null || description != null || imageUrl != null) {
-            ArticleMetadata(title, description, imageUrl)
+        val updatedAt = firstValue(listOf("article:modified_time", "og:updated_time", "dateModified")) {
+            sourceTimestamp(it.attr("content"))
+        }
+        val publishedTime = firstValue(listOf("article:published_time", "datePublished")) { sourceTimestamp(it.attr("content")) }
+        return if (title != null || description != null || imageUrl != null || updatedAt != null || publishedTime != null) {
+            ArticleMetadata(title, description, imageUrl, updatedAt, publishedTime)
         } else {
             null
         }
@@ -141,6 +174,7 @@ class FeedClient(
         parseFeed(response.bytes, response.url, response.charset)?.copy(
             etag = response.etag,
             modified = response.modified,
+            observedAt = System.currentTimeMillis(),
         )
 
     private fun fetch(
@@ -307,6 +341,10 @@ fun parseFeed(bytes: ByteArray, url: String, charset: String? = null): FeedDocum
                 }.orEmpty().take(24_000)
             val dateText = listOf("published", "pubDate", "date", "updated")
                 .firstNotNullOfOrNull { entry.child(it)?.wholeText()?.trim()?.takeIf(String::isNotEmpty) }
+            val updatedAt = listOf("updated", "modified", "dateModified")
+                .firstNotNullOfOrNull { sourceTimestamp(entry.child(it)?.wholeText()) }
+            val publishedTime = listOf("published", "pubDate", "date")
+                .firstNotNullOfOrNull { sourceTimestamp(entry.child(it)?.wholeText()) }
             val externalId = entry.child(if (atom) "id" else "guid")?.wholeText()?.trim()?.takeIf(String::isNotEmpty)
             if (title.isBlank() && body.isBlank() && entryLink == null) return@mapNotNull null
             val stableKey = externalId ?: entryLink ?: "$title\u0000${dateText ?: body}"
@@ -317,6 +355,8 @@ fun parseFeed(bytes: ByteArray, url: String, charset: String? = null): FeedDocum
                 body = body,
                 published = feedDate(dateText),
                 thumbnailUrl = entry.feedThumbnail(url),
+                updatedAt = updatedAt,
+                publishedTime = publishedTime,
             )
         }.distinctBy { it.key }.toList()
     return FeedDocument(
@@ -371,12 +411,16 @@ private fun Element.feedText(): String {
     return html.body().wholeText().trim().replace(Regex("\\n(?:[ \\t]*\\n){2,}"), "\n\n")
 }
 
-private fun feedDate(value: String?): Long? {
-    if (value.isNullOrBlank()) return null
-    return runCatching { Instant.parse(value).toEpochMilli() }.getOrNull()
-        ?: runCatching { ZonedDateTime.parse(value).toInstant().toEpochMilli() }.getOrNull()
+private fun feedDate(value: String?): Long? = sourceTimestamp(value) ?: value?.let {
+    runCatching { LocalDate.parse(it).atStartOfDay(java.time.ZoneOffset.UTC).toInstant().toEpochMilli() }.getOrNull()
+}
+
+internal fun sourceTimestamp(value: String?): Long? {
+    val text = value?.trim()?.takeIf(String::isNotEmpty) ?: return null
+    val iso = if (text.length > 10 && text[10] == ' ') text.replaceRange(10, 11, "T") else text
+    return runCatching { Instant.parse(iso).toEpochMilli() }.getOrNull()
+        ?: runCatching { ZonedDateTime.parse(iso).toInstant().toEpochMilli() }.getOrNull()
         ?: rssDateFormats.firstNotNullOfOrNull { format ->
-            runCatching { ZonedDateTime.parse(value, format).toInstant().toEpochMilli() }.getOrNull()
-        } ?: runCatching { LocalDate.parse(value).atStartOfDay(java.time.ZoneOffset.UTC).toInstant().toEpochMilli() }
-            .getOrNull()
+            runCatching { ZonedDateTime.parse(text, format).toInstant().toEpochMilli() }.getOrNull()
+        }
 }

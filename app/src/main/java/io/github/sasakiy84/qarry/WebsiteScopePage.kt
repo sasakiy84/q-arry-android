@@ -1,6 +1,7 @@
 package io.github.sasakiy84.qarry
 
 import android.annotation.SuppressLint
+import android.database.sqlite.SQLiteException
 import android.view.View
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
@@ -10,6 +11,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -24,6 +26,65 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import kotlinx.coroutines.launch
+
+@Composable
+internal fun EditWebsiteScopePage(
+    library: FeedLibrary,
+    feed: Subscription,
+    saving: Boolean,
+    onSavingChange: (Boolean) -> Unit,
+    onCancel: () -> Unit,
+    onSaved: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var preview by remember { mutableStateOf<WebsiteScopes?>(null) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var attempt by remember { mutableIntStateOf(0) }
+    val scope = rememberCoroutineScope()
+
+    LaunchedEffect(feed.url, attempt) {
+        error = null
+        try {
+            preview = library.inspectWebsite(feed.url)
+        } catch (failure: FeedRequestException) {
+            error = failure.message
+        }
+    }
+    val website = preview
+    val message = error
+    when {
+        website != null -> WebsiteScopePage(
+            website = website,
+            busy = saving,
+            alreadySubscribed = true,
+            error = message,
+            onChangeUrl = onCancel,
+            onRegister = { chosen ->
+                if (!saving) {
+                    onSavingChange(true)
+                    error = null
+                    scope.launch {
+                        try {
+                            if (library.updateWebsiteScope(feed.id, chosen)) onSaved()
+                            else error = "フィードが見つかりませんでした。"
+                        } catch (_: SQLiteException) {
+                            error = "更新範囲を保存できませんでした。"
+                        } finally {
+                            onSavingChange(false)
+                        }
+                    }
+                }
+            },
+            modifier = modifier,
+            backLabel = "キャンセル",
+        )
+        message != null -> Box(modifier, contentAlignment = Alignment.Center) {
+            EmptyState(message, null, action = { attempt++ }, actionLabel = "もう一度探す")
+        }
+        else -> Box(modifier, contentAlignment = Alignment.Center) { LoadingIndicator("監視範囲を探しています") }
+    }
+}
 
 @Composable
 internal fun WebsiteScopePage(
@@ -34,29 +95,35 @@ internal fun WebsiteScopePage(
     onChangeUrl: () -> Unit,
     onRegister: (FeedDocument) -> Unit,
     modifier: Modifier = Modifier,
+    backLabel: String = "URLを変更",
 ) {
-    var selectedIndex by rememberSaveable(website.options.first().feed.url) { mutableIntStateOf(0) }
-    val selected = website.options[selectedIndex.coerceIn(website.options.indices)]
+    var selection by rememberSaveable(website.options.first().feed.url) { mutableStateOf<String?>(null) }
+    val matchingIndex = website.options.indexOfFirst { it.selectionKey == selection }
+    val missingSelection = selection != null && matchingIndex < 0
+    val selectedIndex = matchingIndex.coerceAtLeast(0)
+    val selected = website.options[selectedIndex]
+    val watch = remember(selected.feed.htmlWatch) { selected.feed.htmlWatch?.let(::decodeWebsiteWatch) }
     val largeText = LocalDensity.current.fontScale >= 1.5f
+    val optionsState = rememberLazyListState()
+    val articlesState = key(selected.selectionKey) { rememberLazyListState() }
     BackHandler { if (!busy) onChangeUrl() }
-    Column(modifier) {
-        WebsitePreview(website.html, selected.highlightIds, Modifier.fillMaxWidth().weight(if (largeText) 0.5f else 1f))
-        HorizontalDivider()
-        Column(Modifier.fillMaxWidth().weight(1f)) {
+    val controls: @Composable (Modifier) -> Unit = { panel ->
+        Column(panel) {
             Text(
                 "登録する範囲",
                 Modifier.padding(start = 20.dp, top = 12.dp).semantics { heading() },
                 style = MaterialTheme.typography.titleSmall,
             )
             LazyRow(
+                state = optionsState,
                 contentPadding = PaddingValues(horizontal = 20.dp, vertical = 3.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 items(website.options.indices.toList()) { index ->
                     val option = website.options[index]
                     FilterChip(
-                        selected = index == selectedIndex,
-                        onClick = { selectedIndex = index },
+                        selected = !missingSelection && index == selectedIndex,
+                        onClick = { selection = option.selectionKey },
                         enabled = !busy,
                         label = {
                             Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
@@ -72,7 +139,7 @@ internal fun WebsiteScopePage(
                 }
             }
             key(selectedIndex) {
-                LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(horizontal = 20.dp)) {
+                LazyColumn(Modifier.weight(1f), state = articlesState, contentPadding = PaddingValues(horizontal = 20.dp)) {
                     selected.feed.htmlItemSelector?.let { selector ->
                         item {
                             Column(
@@ -83,6 +150,9 @@ internal fun WebsiteScopePage(
                                     "クエリパス（CSSセレクター）", Modifier.semantics { heading() },
                                     style = MaterialTheme.typography.labelMedium,
                                 )
+                                if (watch?.table != null) watch.heading?.let { heading ->
+                                    Text("見出し「${heading.text}」から表を特定", style = MaterialTheme.typography.bodySmall)
+                                }
                                 SelectionContainer {
                                     Text(
                                         selector,
@@ -103,6 +173,8 @@ internal fun WebsiteScopePage(
                                 maxLines = 2,
                                 overflow = TextOverflow.Ellipsis,
                             )
+                            articleTimestampLabel(article.updatedAt, article.publishedTime, discoveredAt = selected.feed.observedAt)
+                                ?.let { date -> Text(date, style = MaterialTheme.typography.labelSmall) }
                             article.body?.let { description ->
                                 Text(
                                     description, style = MaterialTheme.typography.bodySmall,
@@ -115,7 +187,7 @@ internal fun WebsiteScopePage(
                     }
                 }
             }
-            error?.let {
+            (error ?: "前に選んだ範囲が見つかりません。範囲を選び直してください。".takeIf { missingSelection })?.let {
                 Text(it, Modifier.padding(horizontal = 20.dp).announceStatus(), color = MaterialTheme.colorScheme.error,
                     style = MaterialTheme.typography.bodySmall)
             }
@@ -124,17 +196,39 @@ internal fun WebsiteScopePage(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 itemVerticalAlignment = Alignment.CenterVertically,
             ) {
-                TextButton(onChangeUrl, enabled = !busy) { Text("URLを変更") }
+                TextButton(onChangeUrl, enabled = !busy) { Text(backLabel) }
                 Button(
                     onClick = { onRegister(selected.feed) },
-                    enabled = !busy,
+                    enabled = !busy && !missingSelection,
                 ) {
                     Text(if (alreadySubscribed) "更新範囲を変更" else "この範囲を登録")
                 }
             }
         }
     }
+    BoxWithConstraints(modifier) {
+        if (maxHeight < 440.dp && maxWidth >= 560.dp) {
+            Row(Modifier.fillMaxSize()) {
+                WebsitePreview(website.html, selected.highlightIds, Modifier.weight(1f).fillMaxHeight())
+                VerticalDivider()
+                controls(Modifier.weight(1f).fillMaxHeight())
+            }
+        } else {
+            val previewWeight = when {
+                maxHeight < 440.dp -> 0.35f
+                largeText -> 0.5f
+                else -> 1f
+            }
+            Column(Modifier.fillMaxSize()) {
+                WebsitePreview(website.html, selected.highlightIds, Modifier.fillMaxWidth().weight(previewWeight))
+                HorizontalDivider()
+                controls(Modifier.fillMaxWidth().weight(1f))
+            }
+        }
+    }
 }
+
+private val WebsiteScope.selectionKey: String get() = "$label\u0000${feed.htmlItemSelector}"
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable

@@ -4,12 +4,14 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
-import androidx.compose.runtime.Composable
+import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalDensity
@@ -177,29 +179,55 @@ private fun RatingHistoryRow(entry: RatedArticle, onOpen: (ArticlePress) -> Unit
 internal fun FeedDetailPage(
     feed: Subscription,
     queues: List<FeedQueue>,
-    listing: ArticleListing,
+    library: FeedLibrary,
+    revision: Int,
     refreshing: Boolean,
     onLink: (String) -> Unit,
     onQueue: (Long) -> Unit,
     onManage: () -> Unit,
     onKeywordFilter: () -> Unit,
-    showingUnfiltered: Boolean,
-    onToggleUnfiltered: () -> Unit,
     onFavoriteChange: (Boolean) -> Unit,
     onRefresh: () -> Unit,
+    onChangeWebsiteScope: () -> Unit,
     onUnsubscribe: () -> Unit,
     onArticle: (Article, ArticlePress) -> Unit,
     onDismiss: suspend (Article, ArticleRating?) -> Boolean,
-    onMore: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    var unfiltered by rememberSaveable(feed.keywordFilter) { mutableStateOf(false) }
+    var limit by rememberSaveable(feed.keywordFilter) { mutableIntStateOf(75) }
+    var articles by remember { mutableStateOf<ArticleListing?>(null) }
+    var loadedFilter by remember { mutableStateOf<Pair<KeywordFilter?, Boolean>?>(null) }
+    var failed by remember { mutableStateOf(false) }
+    var attempt by remember { mutableIntStateOf(0) }
+    val showingUnfiltered = unfiltered && feed.keywordFilter != null
+    val filter = feed.keywordFilter to showingUnfiltered
+    LaunchedEffect(feed.id, filter, revision, limit, attempt) {
+        failed = false
+        try {
+            articles = library.feedArticles(feed.id, limit, applyKeywordFilter = !showingUnfiltered)
+            loadedFilter = filter
+        } catch (_: android.database.sqlite.SQLiteException) {
+            failed = true
+        }
+    }
+    val listing = articles
+    if (failed) {
+        EmptyState("フィードの記事を読み込めませんでした", null, { attempt++ }, "再試行")
+        return
+    }
+    if (listing == null || loadedFilter != filter) {
+        LoadingIndicator("フィードの記事を読み込み中")
+        return
+    }
     val webPage = feed.htmlItemSelector != null
     val home = feed.homeUrl?.let(::webUrl)?.takeUnless { it == feed.url }
     val site = if (webPage) feed.url else home ?: webUrl(feed.url)?.let { url ->
         URI(url).let { "${it.scheme}://${it.rawAuthority}/" }
     }
 
-    LazyColumn(modifier, contentPadding = PaddingValues(bottom = 24.dp)) {
+    val listState = key(feed.keywordFilter, showingUnfiltered) { rememberLazyListState() }
+    LazyColumn(modifier, state = listState, contentPadding = PaddingValues(bottom = 24.dp)) {
         item {
             Column(
                 Modifier.padding(horizontal = 20.dp, vertical = 16.dp),
@@ -247,9 +275,17 @@ internal fun FeedDetailPage(
                         Text(feed.keywordFilter?.let { "フィルター（${it.summary}）" } ?: "フィルターを設定")
                     }
                     TextButton(onRefresh, enabled = !refreshing) { Text("今すぐ更新") }
+                    if (webPage && feed.error != WEBSITE_SCOPE_CHANGED) {
+                        TextButton(onChangeWebsiteScope) { Text("監視範囲を変更") }
+                    }
                     TextButton(onUnsubscribe) { Text("購読を解除") }
                 }
-                feed.error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+                feed.error?.let {
+                    Text(it, Modifier.announceStatus(), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                }
+                if (webPage && feed.error == WEBSITE_SCOPE_CHANGED) {
+                    OutlinedButton(onChangeWebsiteScope) { Text("範囲を選び直す") }
+                }
             }
             HorizontalDivider()
             FlowRow(
@@ -259,16 +295,16 @@ internal fun FeedDetailPage(
             ) {
                 Text("記事一覧", Modifier.semantics { heading() }, style = MaterialTheme.typography.titleMedium)
                 if (feed.keywordFilter != null) {
-                    FilterChip(showingUnfiltered, onToggleUnfiltered, label = { Text("絞り込み前を表示") })
+                    FilterChip(showingUnfiltered, { unfiltered = !unfiltered; limit = 75 }, label = { Text("絞り込み前を表示") })
                 }
             }
             if (listing.articles.isEmpty()) {
                 val message = if (feed.keywordFilter != null && !showingUnfiltered) "絞り込み後の記事がありません"
                 else "表示する記事がありません"
-                EmptyState(message, null)
+                EmptyState(message, null, scrollable = false)
             }
         }
         articleCards(listing.articles, onArticle, onDismiss)
-        if (listing.hasMore) moreArticles(onMore)
+        if (listing.hasMore) moreArticles { limit += 75 }
     }
 }

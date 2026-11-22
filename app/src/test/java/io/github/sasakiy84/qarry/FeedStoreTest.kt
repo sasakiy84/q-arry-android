@@ -1,6 +1,7 @@
 package io.github.sasakiy84.qarry
 
 import android.app.Application
+import android.database.sqlite.SQLiteDatabase
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.*
@@ -358,6 +359,7 @@ class FeedStoreTest {
         assertTrue(store.load(queueId, true, 1).hasMore)
         assertEquals(2, store.markAllRead(queueId))
         assertTrue(store.load(queueId, true, 10).articles.isEmpty())
+        assertFalse(store.load(queueId, false, 1).hasUnread)
         assertEquals(listOf("その他", "First article"), store.load(null, true, 10).articles.map { it.title })
         assertEquals(0, store.markAllRead(queueId))
         assertEquals(2, store.markAllRead(null))
@@ -430,6 +432,8 @@ class FeedStoreTest {
         // Rebuild the original schema without the later feed and article metadata.
         store.writableDatabase.apply {
             execSQL("DROP TABLE keyword_filter")
+            execSQL("ALTER TABLE feed DROP COLUMN html_watch")
+            dropArticleTimestampColumns()
             execSQL("DROP INDEX article_viewed")
             execSQL("DROP INDEX article_feed_newest")
             execSQL("DROP TABLE article_feedback")
@@ -464,6 +468,8 @@ class FeedStoreTest {
         val feedId = store.subscribe(website, null)
         store.writableDatabase.apply {
             execSQL("DROP TABLE keyword_filter")
+            execSQL("ALTER TABLE feed DROP COLUMN html_watch")
+            dropArticleTimestampColumns()
             execSQL("DROP INDEX article_viewed")
             execSQL("DROP INDEX article_feed_newest")
             execSQL("DROP TABLE article_feedback")
@@ -491,6 +497,8 @@ class FeedStoreTest {
         store.recordView(articleId)
         store.writableDatabase.apply {
             execSQL("DROP TABLE keyword_filter")
+            execSQL("ALTER TABLE feed DROP COLUMN html_watch")
+            dropArticleTimestampColumns()
             execSQL("DROP INDEX article_feed_newest")
             execSQL("ALTER TABLE feed DROP COLUMN is_favorite")
             version = 3
@@ -510,6 +518,8 @@ class FeedStoreTest {
         store.setFeedFavorite(feedId, true)
         store.writableDatabase.apply {
             execSQL("DROP TABLE keyword_filter")
+            execSQL("ALTER TABLE feed DROP COLUMN html_watch")
+            dropArticleTimestampColumns()
             execSQL("DROP INDEX article_feed_newest")
             version = 4
         }
@@ -530,6 +540,8 @@ class FeedStoreTest {
         store.dismissArticle(articleId, ArticleRating.Good)
         store.writableDatabase.apply {
             execSQL("DROP TABLE keyword_filter")
+            execSQL("ALTER TABLE feed DROP COLUMN html_watch")
+            dropArticleTimestampColumns()
             version = 5
         }
         store.close()
@@ -541,5 +553,106 @@ class FeedStoreTest {
         assertNull(restored.keywordFilter)
         assertTrue(restored.queueKeywordFilters.isEmpty())
         assertEquals(ArticleRating.Good, store.article(articleId)?.rating)
+    }
+
+    @Test
+    fun reselectingAMigratedWebsiteRetainsArticlesAndRejectsAnOlderRefresh() {
+        store.queueName(null, "Daily")
+        val queueId = store.load(null, false, 10).queues.single().id
+        val website = example.copy(htmlItemSelector = "main > table:nth-child(2) > tbody > tr")
+        val feedId = store.subscribe(website, queueId)
+        val rule = KeywordFilter(KeywordFilterMode.Include, listOf("article"))
+        store.setFeedKeywordFilter(feedId, rule)
+        val oldArticle = store.load(queueId, false, 10).articles.single()
+        store.recordView(oldArticle.id)
+        store.setFeedFavorite(feedId, true)
+        store.writableDatabase.apply {
+            execSQL("ALTER TABLE feed DROP COLUMN html_watch")
+            dropArticleTimestampColumns()
+            version = 6
+        }
+        store.close()
+        store = FeedStore(RuntimeEnvironment.getApplication())
+        val migrated = store.subscriptions().single()
+        assertEquals(website.htmlItemSelector, migrated.htmlItemSelector)
+        assertNull(migrated.htmlWatch)
+        assertEquals(rule, migrated.keywordFilter)
+
+        val choice = website.copy(
+            htmlItemSelector = "#updates article",
+            htmlWatch = encodeWebsiteWatch(WebsiteWatch(null, null, false, setOf("publisher.example/news/"), emptySet())),
+            articles = listOf(FeedArticle("second", "Second article", "https://publisher.example/news/2", null, 2000L)),
+        )
+        assertTrue(store.recordRefresh(feedId, null, expected = migrated, error = WEBSITE_SCOPE_CHANGED))
+        assertEquals(WEBSITE_SCOPE_CHANGED, store.subscriptions().single().error)
+        assertTrue(store.updateWebsiteScope(feedId, choice))
+        assertFalse(store.recordRefresh(feedId, website, expected = migrated))
+        assertFalse(store.recordRefresh(feedId, null, expected = migrated, error = WEBSITE_SCOPE_CHANGED))
+        val updated = store.subscriptions().single()
+        assertEquals(choice.htmlItemSelector, updated.htmlItemSelector)
+        assertEquals(choice.htmlWatch, updated.htmlWatch)
+        assertNull(updated.error)
+        assertEquals(setOf(queueId), updated.queueIds)
+        assertEquals(rule, updated.keywordFilter)
+        assertTrue(updated.isFavorite)
+        assertEquals(listOf("Second article", "First article"), store.feedArticles(feedId, 10).articles.map { it.title })
+        assertTrue(checkNotNull(store.article(oldArticle.id)).read)
+        assertEquals(oldArticle.id, store.history(10).articles.single().id)
+    }
+
+    @Test
+    fun undatedArticlesKeepTheDetectionTimeUntilTheirContentChanges() {
+        val initial = example.copy(
+            observedAt = 1_000L,
+            articles = example.articles.map { it.copy(published = null, publishedTime = null) },
+        )
+        val feedId = store.subscribe(initial, null)
+        val articleId = store.feedArticles(feedId, 10).articles.single().id
+        assertEquals(1_000L, store.article(articleId)?.discoveredAt)
+        assertNull(store.article(articleId)?.changeDetectedAt)
+
+        store.recordRefresh(feedId, initial.copy(observedAt = 2_000L))
+        assertEquals(1_000L, store.article(articleId)?.discoveredAt)
+        assertNull(store.article(articleId)?.changeDetectedAt)
+
+        val changed = initial.copy(observedAt = 3_000L, articles = initial.articles.map { it.copy(body = "更新") })
+        store.recordRefresh(feedId, changed)
+        store.recordRefresh(feedId, changed.copy(observedAt = 4_000L))
+        val article = checkNotNull(store.article(articleId))
+        assertEquals(3_000L, article.changeDetectedAt)
+        assertEquals(1_000L, article.discoveredAt)
+        assertTrue(article.timestampLabel(null)?.startsWith("更新検知 ") == true)
+
+        val dated = changed.copy(articles = changed.articles.map { it.copy(updatedAt = 2_500L) })
+        store.recordRefresh(feedId, dated)
+        val updated = checkNotNull(store.article(articleId))
+        assertEquals(2_500L, updated.updatedAt)
+        assertTrue(updated.timestampLabel(null)?.startsWith("更新 ") == true)
+    }
+
+    @Test
+    fun upgradingVersionSevenKeepsTheWebsiteScopeAndOriginalDetectionTime() {
+        val watch = encodeWebsiteWatch(WebsiteWatch(null, null, false, setOf("publisher.example/"), setOf("sample")))
+        val website = example.copy(
+            htmlItemSelector = "main article", htmlWatch = watch, observedAt = 5_000L, etag = "\"old\"",
+        )
+        val id = store.subscribe(website, null)
+        store.writableDatabase.apply {
+            dropArticleTimestampColumns()
+            version = 7
+        }
+        store.close()
+        store = FeedStore(RuntimeEnvironment.getApplication())
+
+        val restored = store.subscriptions().single()
+        assertEquals(watch, restored.htmlWatch)
+        assertNull(restored.etag)
+        assertEquals(5_000L, store.feedArticles(id, 10).articles.single().discoveredAt)
+    }
+
+    private fun SQLiteDatabase.dropArticleTimestampColumns() {
+        execSQL("ALTER TABLE article DROP COLUMN source_updated_at")
+        execSQL("ALTER TABLE article DROP COLUMN source_published_at")
+        execSQL("ALTER TABLE article DROP COLUMN change_detected_at")
     }
 }
