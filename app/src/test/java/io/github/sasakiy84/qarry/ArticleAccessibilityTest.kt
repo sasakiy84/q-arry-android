@@ -7,7 +7,6 @@ import android.view.KeyEvent.KEYCODE_TAB
 import android.view.KeyEvent.ACTION_DOWN
 import android.view.KeyEvent.ACTION_UP
 import android.view.View
-import android.view.ViewGroup
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.fillMaxSize
@@ -17,7 +16,6 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.node.RootForTest
 import androidx.compose.ui.semantics.SemanticsActions
-import androidx.compose.ui.semantics.SemanticsNode
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.text.TextLayoutResult
 import org.junit.After
@@ -66,7 +64,7 @@ class ArticleAccessibilityTest {
             }
         }) { _, compose ->
             assertEquals(2f, compose.density.fontScale)
-            val merged = compose.semanticsOwner.rootSemanticsNode.allNodes()
+            val merged = compose.semanticsOwner.rootSemanticsNode.semanticTree()
             assertTrue(merged.any { it.text() == "記事" && SemanticsProperties.Heading in it.config })
             assertTrue(merged.any { it.text() == "すべて既読にする" && SemanticsActions.OnClick in it.config })
             val card = merged.single { SemanticsActions.CustomActions in it.config }
@@ -84,7 +82,7 @@ class ArticleAccessibilityTest {
             )
             assertTrue(actions.last().action())
 
-            val title = compose.semanticsOwner.unmergedRootSemanticsNode.allNodes().single { it.text() == article.displayTitle }
+            val title = compose.semanticsOwner.unmergedRootSemanticsNode.semanticTree().single { it.text() == article.displayTitle }
             val result = mutableListOf<TextLayoutResult>()
             assertTrue(checkNotNull(title.config[SemanticsActions.GetTextLayoutResult].action).invoke(result))
             assertEquals(2, result.single().lineCount)
@@ -101,7 +99,7 @@ class ArticleAccessibilityTest {
                 onReadChange = {}, onOpen = {}, onShare = { _, _ -> }, modifier = Modifier.fillMaxSize(),
             )
         }) { decor, compose ->
-            fun nodes() = compose.semanticsOwner.rootSemanticsNode.allNodes()
+            fun nodes() = compose.semanticsOwner.rootSemanticsNode.semanticTree()
             assertTrue(nodes().any { it.text() == article.displayTitle && SemanticsProperties.Heading in it.config })
             fun focused() = nodes().firstOrNull {
                 it.text().isNotEmpty() && it.config.getOrElse(SemanticsProperties.Focused) { false }
@@ -124,22 +122,11 @@ class ArticleAccessibilityTest {
             activity.setContent { MaterialTheme { content() } }
             val decor = activity.window.decorView
             settle(decor)
-            val compose = decor.descendants().single { it is RootForTest }
+            val compose = decor.views().single { it is RootForTest }
             compose.requestFocusFromTouch()
             check(decor, compose as RootForTest)
         }
     }
-
-    private fun View.descendants(): Sequence<View> = sequence {
-        yield(this@descendants)
-        if (this@descendants is ViewGroup) repeat(childCount) { yieldAll(getChildAt(it).descendants()) }
-    }
-
-    private fun SemanticsNode.allNodes(): Sequence<SemanticsNode> =
-        sequenceOf(this) + children.asSequence().flatMap { it.allNodes() }
-
-    private fun SemanticsNode.text(): String =
-        config.getOrElse(SemanticsProperties.Text) { emptyList() }.joinToString(" ") { it.text }
 
     private fun press(view: View, code: Int) {
         view.dispatchKeyEvent(AndroidKeyEvent(0, 0, ACTION_DOWN, code, 0, 0, -1, 0, 0, InputDevice.SOURCE_KEYBOARD))
@@ -149,9 +136,7 @@ class ArticleAccessibilityTest {
     private fun settle(view: View) {
         repeat(14) {
             shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(16))
-            view.measure(View.MeasureSpec.makeMeasureSpec(320, View.MeasureSpec.EXACTLY),
-                View.MeasureSpec.makeMeasureSpec(800, View.MeasureSpec.EXACTLY))
-            view.layout(0, 0, 320, 800)
+            view.layoutAt(320, 800)
             Thread.sleep(4)
         }
     }

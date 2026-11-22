@@ -36,8 +36,6 @@ internal enum class SettingsTab(val label: String) {
     Rated("評価履歴"),
 }
 
-internal enum class OpmlTransfer { Importing, Exporting }
-
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun SettingsPage(

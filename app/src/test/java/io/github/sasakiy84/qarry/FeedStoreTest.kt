@@ -430,10 +430,8 @@ class FeedStoreTest {
         val articleId = store.load(queueId, false, 10).articles.single().id
         store.setRead(articleId, true)
         // Rebuild the original schema without the later feed and article metadata.
-        store.writableDatabase.apply {
+        reopenFromVersion(1) {
             execSQL("DROP TABLE keyword_filter")
-            execSQL("ALTER TABLE feed DROP COLUMN html_watch")
-            dropArticleTimestampColumns()
             execSQL("DROP INDEX article_viewed")
             execSQL("DROP INDEX article_feed_newest")
             execSQL("DROP TABLE article_feedback")
@@ -443,10 +441,7 @@ class FeedStoreTest {
             execSQL("ALTER TABLE article DROP COLUMN thumbnail_url")
             execSQL("ALTER TABLE article DROP COLUMN viewed_at")
             execSQL("ALTER TABLE article DROP COLUMN dismissed")
-            version = 1
         }
-        store.close()
-        store = FeedStore(RuntimeEnvironment.getApplication())
         val migrated = store.load(queueId, false, 10)
         assertNull(migrated.subscriptions.single().htmlItemSelector)
         assertEquals(setOf(queueId), migrated.subscriptions.single().queueIds)
@@ -466,10 +461,8 @@ class FeedStoreTest {
             articles = example.articles.map { it.copy(thumbnailUrl = "https://publisher.example/image.png") },
         )
         val feedId = store.subscribe(website, null)
-        store.writableDatabase.apply {
+        reopenFromVersion(2) {
             execSQL("DROP TABLE keyword_filter")
-            execSQL("ALTER TABLE feed DROP COLUMN html_watch")
-            dropArticleTimestampColumns()
             execSQL("DROP INDEX article_viewed")
             execSQL("DROP INDEX article_feed_newest")
             execSQL("DROP TABLE article_feedback")
@@ -477,10 +470,7 @@ class FeedStoreTest {
             execSQL("ALTER TABLE feed DROP COLUMN is_favorite")
             execSQL("ALTER TABLE article DROP COLUMN viewed_at")
             execSQL("ALTER TABLE article DROP COLUMN dismissed")
-            version = 2
         }
-        store.close()
-        store = FeedStore(RuntimeEnvironment.getApplication())
         val subscription = store.subscriptions().single()
         assertEquals(website.htmlItemSelector, subscription.htmlItemSelector)
         assertFalse(subscription.isFavorite)
@@ -491,64 +481,24 @@ class FeedStoreTest {
     }
 
     @Test
-    fun upgradingVersionThreeKeepsExistingFeedLinksAndHistory() {
-        val feedId = store.subscribe(example, null)
-        val articleId = store.feedArticles(feedId, 10).articles.single().id
-        store.recordView(articleId)
-        store.writableDatabase.apply {
-            execSQL("DROP TABLE keyword_filter")
-            execSQL("ALTER TABLE feed DROP COLUMN html_watch")
-            dropArticleTimestampColumns()
-            execSQL("DROP INDEX article_feed_newest")
-            execSQL("ALTER TABLE feed DROP COLUMN is_favorite")
-            version = 3
-        }
-        store.close()
-        store = FeedStore(RuntimeEnvironment.getApplication())
-
-        val feed = store.subscriptions().single()
-        assertEquals(example.home, feed.homeUrl)
-        assertFalse(feed.isFavorite)
-        assertEquals(articleId, store.history(10).articles.single().id)
-    }
-
-    @Test
-    fun upgradingVersionFourKeepsFavoritesAndComputesTheLatestArticleDate() {
-        val feedId = store.subscribe(example, null)
-        store.setFeedFavorite(feedId, true)
-        store.writableDatabase.apply {
-            execSQL("DROP TABLE keyword_filter")
-            execSQL("ALTER TABLE feed DROP COLUMN html_watch")
-            dropArticleTimestampColumns()
-            execSQL("DROP INDEX article_feed_newest")
-            version = 4
-        }
-        store.close()
-        store = FeedStore(RuntimeEnvironment.getApplication())
-
-        val restored = store.subscriptions().single()
-        assertTrue(restored.isFavorite)
-        assertEquals(example.articles.single().published, restored.latestArticleAt)
-    }
-
-    @Test
-    fun upgradingVersionFiveKeepsExistingQueuesArticlesAndRatingsWithNoFilters() {
+    fun upgradingVersionFiveKeepsFeedDetailsHistoryAndRatingsWithoutCreatingFilters() {
         store.queueName(null, "Daily")
         val queueId = store.load(null, false, 10).queues.single().id
         val feedId = store.subscribe(example, queueId)
         val articleId = store.load(queueId, false, 10).articles.single().id
+        store.recordView(articleId)
+        store.setFeedFavorite(feedId, true)
         store.dismissArticle(articleId, ArticleRating.Good)
-        store.writableDatabase.apply {
+        reopenFromVersion(5) {
             execSQL("DROP TABLE keyword_filter")
-            execSQL("ALTER TABLE feed DROP COLUMN html_watch")
-            dropArticleTimestampColumns()
-            version = 5
         }
-        store.close()
-        store = FeedStore(RuntimeEnvironment.getApplication())
 
         val restored = store.subscriptions().single()
         assertEquals(feedId, restored.id)
+        assertEquals(example.home, restored.homeUrl)
+        assertEquals(example.articles.single().published, restored.latestArticleAt)
+        assertTrue(restored.isFavorite)
+        assertEquals(articleId, store.history(10).articles.single().id)
         assertEquals(setOf(queueId), restored.queueIds)
         assertNull(restored.keywordFilter)
         assertTrue(restored.queueKeywordFilters.isEmpty())
@@ -566,13 +516,7 @@ class FeedStoreTest {
         val oldArticle = store.load(queueId, false, 10).articles.single()
         store.recordView(oldArticle.id)
         store.setFeedFavorite(feedId, true)
-        store.writableDatabase.apply {
-            execSQL("ALTER TABLE feed DROP COLUMN html_watch")
-            dropArticleTimestampColumns()
-            version = 6
-        }
-        store.close()
-        store = FeedStore(RuntimeEnvironment.getApplication())
+        reopenFromVersion(6)
         val migrated = store.subscriptions().single()
         assertEquals(website.htmlItemSelector, migrated.htmlItemSelector)
         assertNull(migrated.htmlWatch)
@@ -637,12 +581,7 @@ class FeedStoreTest {
             htmlItemSelector = "main article", htmlWatch = watch, observedAt = 5_000L, etag = "\"old\"",
         )
         val id = store.subscribe(website, null)
-        store.writableDatabase.apply {
-            dropArticleTimestampColumns()
-            version = 7
-        }
-        store.close()
-        store = FeedStore(RuntimeEnvironment.getApplication())
+        reopenFromVersion(7)
 
         val restored = store.subscriptions().single()
         assertEquals(watch, restored.htmlWatch)
@@ -650,9 +589,16 @@ class FeedStoreTest {
         assertEquals(5_000L, store.feedArticles(id, 10).articles.single().discoveredAt)
     }
 
-    private fun SQLiteDatabase.dropArticleTimestampColumns() {
-        execSQL("ALTER TABLE article DROP COLUMN source_updated_at")
-        execSQL("ALTER TABLE article DROP COLUMN source_published_at")
-        execSQL("ALTER TABLE article DROP COLUMN change_detected_at")
+    private fun reopenFromVersion(version: Int, removeNewerSchema: SQLiteDatabase.() -> Unit = {}) {
+        store.writableDatabase.apply {
+            execSQL("ALTER TABLE article DROP COLUMN source_updated_at")
+            execSQL("ALTER TABLE article DROP COLUMN source_published_at")
+            execSQL("ALTER TABLE article DROP COLUMN change_detected_at")
+            if (version < 7) execSQL("ALTER TABLE feed DROP COLUMN html_watch")
+            removeNewerSchema()
+            this.version = version
+        }
+        store.close()
+        store = FeedStore(RuntimeEnvironment.getApplication())
     }
 }

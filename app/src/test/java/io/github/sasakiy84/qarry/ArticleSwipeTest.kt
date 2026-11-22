@@ -136,11 +136,7 @@ class ArticleSwipeTest {
     private fun settle(root: View, frames: Int) {
         repeat(frames) {
             shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(16))
-            root.measure(
-                View.MeasureSpec.makeMeasureSpec(360, View.MeasureSpec.EXACTLY),
-                View.MeasureSpec.makeMeasureSpec(800, View.MeasureSpec.EXACTLY),
-            )
-            root.layout(0, 0, 360, 800)
+            root.layoutAt(360, 800)
         }
     }
 }
