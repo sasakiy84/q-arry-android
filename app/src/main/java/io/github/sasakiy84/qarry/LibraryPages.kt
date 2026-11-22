@@ -21,6 +21,9 @@ import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.hideFromAccessibility
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
@@ -38,21 +41,29 @@ import java.util.Locale
 private val pagePadding = PaddingValues(start = 20.dp, end = 20.dp, top = 16.dp, bottom = 28.dp)
 
 @Composable
-fun ArticlesPage(
+internal fun ArticlesPage(
     snapshot: LibrarySnapshot,
     queueId: Long?,
     unread: Boolean,
+    markingRead: Boolean,
     onQueue: (Long?) -> Unit,
     onUnread: () -> Unit,
+    onMarkAllRead: () -> Unit,
     onAdd: () -> Unit,
     onMore: () -> Unit,
-    onArticle: (Article) -> Unit,
+    onArticle: (Article, ArticlePress) -> Unit,
     onDismiss: suspend (Article, ArticleRating?) -> Boolean,
     modifier: Modifier = Modifier,
 ) {
+    val queue = snapshot.queues.firstOrNull { it.id == queueId }
+    var confirmMarkAllRead by rememberSaveable { mutableStateOf(false) }
     Column(modifier) {
-        PageHeading(snapshot.queues.firstOrNull { it.id == queueId }?.name ?: "記事") {
+        PageHeading(queue?.name ?: "記事") {
             FilterChip(selected = unread, onClick = onUnread, label = { Text("未読のみ") })
+            TextButton(
+                onClick = { confirmMarkAllRead = true },
+                enabled = !markingRead && (snapshot.hasMore || snapshot.articles.any { !it.read }),
+            ) { Text("すべて既読にする") }
         }
         if (snapshot.queues.isNotEmpty()) {
             LazyRow(
@@ -82,21 +93,32 @@ fun ArticlesPage(
             }
             EmptyState(
                 title = title,
-                description = when {
-                    snapshot.subscriptions.isEmpty() -> "サイトかフィードのURLを入力すると、記事をここで読めます。"
-                    queueId != null && !unread -> "フィード画面から、このキューにフィードを追加できます。"
-                    else -> null
-                },
+                description = if (queueId != null && !unread && snapshot.subscriptions.isNotEmpty()) {
+                    "フィード画面から、このキューにフィードを追加できます。"
+                } else null,
                 action = if (snapshot.subscriptions.isEmpty()) onAdd else null,
                 actionLabel = "フィードを追加",
             )
         } else {
-            SwipeHint()
             LazyColumn(modifier = Modifier.weight(1f), contentPadding = PaddingValues(bottom = 24.dp)) {
                 articleCards(snapshot.articles, onArticle, onDismiss)
                 if (snapshot.hasMore) moreArticles(onMore)
             }
         }
+    }
+    if (confirmMarkAllRead) {
+        AlertDialog(
+            onDismissRequest = { confirmMarkAllRead = false },
+            title = { Text("すべて既読にしますか？") },
+            text = { Text(queue?.let { "「${it.name}」の未読記事を既読にします。" } ?: "この一覧の未読記事をすべて既読にします。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmMarkAllRead = false
+                    onMarkAllRead()
+                }) { Text("既読にする") }
+            },
+            dismissButton = { TextButton(onClick = { confirmMarkAllRead = false }) { Text("キャンセル") } },
+        )
     }
 }
 
@@ -105,30 +127,46 @@ fun ArticlePage(
     article: Article,
     onFeed: () -> Unit,
     onRemove: () -> Unit,
+    onRate: (ArticleRating) -> Unit,
     onReadChange: (Boolean) -> Unit,
     onOpen: (String) -> Unit,
+    onShare: (String, String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val metadata = rememberArticleMetadata(article.url)
+    val image = rememberArticleImage(metadata?.imageUrl, article.thumbnailUrl)
+    val title = metadata?.title ?: article.displayTitle
+    val articleUrl = article.url?.takeIf { webUrl(it) != null }
     LazyColumn(modifier, contentPadding = pagePadding, verticalArrangement = Arrangement.spacedBy(18.dp)) {
         item {
             TextButton(onFeed, contentPadding = PaddingValues(0.dp)) {
                 Text(article.feedTitle, style = MaterialTheme.typography.labelLarge)
             }
             Spacer(Modifier.height(8.dp))
-            Text(article.displayTitle, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
+            Text(
+                title,
+                Modifier.semantics { heading() },
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.SemiBold,
+            )
             article.published?.let {
                 Spacer(Modifier.height(8.dp))
                 Text(entryDate(it), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
         item {
-            ArticleThumbnail(article.url, article.thumbnailUrl, Modifier.fillMaxWidth().aspectRatio(16f / 9f))
+            ArticleThumbnail(image, Modifier.fillMaxWidth().aspectRatio(16f / 9f))
         }
         item {
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                article.url?.let { url -> Button(onClick = { onOpen(url) }) { Text("元の記事を開く") } }
-                article.thumbnailUrl?.let { url ->
-                    TextButton(onClick = { onOpen(url) }) { Text("サムネイル画像を開く") }
+                articleUrl?.let { url ->
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Button(onClick = { onOpen(url) }) { Text("元の記事を開く") }
+                        OutlinedButton(onClick = { onShare(title, url) }) { Text("共有") }
+                    }
                 }
                 TextButton(onClick = { onReadChange(!article.read) }) {
                     Text(if (article.read) "未読に戻す" else "既読にする")
@@ -136,10 +174,19 @@ fun ArticlePage(
                 if (article.dismissed) {
                     Text(
                         article.rating?.let { "${it.label} ・ キューから削除済み" } ?: "キューから削除済み",
+                        Modifier.announceStatus(),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 } else {
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        ArticleRating.entries.forEach { rating ->
+                            OutlinedButton(onClick = { onRate(rating) }) { Text("${rating.label} と評価") }
+                        }
+                    }
                     TextButton(onRemove) { Text("すべてのキューから削除") }
                 }
             }
@@ -148,7 +195,7 @@ fun ArticlePage(
         item {
             SelectionContainer {
                 Text(
-                    article.body ?: "説明文はありません。",
+                    metadata?.description ?: article.body ?: "説明文はありません。",
                     style = MaterialTheme.typography.bodyLarge,
                 )
             }
@@ -169,13 +216,13 @@ fun QueuesPage(
         PageHeading("キュー") { OutlinedButton(onAdd) { Text("新規作成") } }
         HorizontalDivider()
         if (queues.isEmpty()) {
-            EmptyState("キューがありません", "フィードをキューに登録すると、キューごとに記事を読めます。")
+            EmptyState("キューがありません", null)
         } else {
             LazyColumn(contentPadding = PaddingValues(bottom = 24.dp)) {
                 items(queues, key = { it.id }) { queue ->
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                         Column(
-                            Modifier.weight(1f).clickable(role = Role.Button) { onOpen(queue) }
+                            Modifier.weight(1f).clickable(role = Role.Button, onClickLabel = "キューの記事を開く") { onOpen(queue) }
                                 .padding(horizontal = 20.dp, vertical = 16.dp),
                             verticalArrangement = Arrangement.spacedBy(4.dp),
                         ) {
@@ -186,7 +233,7 @@ fun QueuesPage(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
-                        RowMenu("キューの操作", listOf("名前を変更" to { onRename(queue) }, "削除" to { onDelete(queue) }))
+                        RowMenu("「${queue.name}」の操作", listOf("名前を変更" to { onRename(queue) }, "削除" to { onDelete(queue) }))
                         Spacer(Modifier.width(12.dp))
                     }
                     HorizontalDivider(Modifier.padding(horizontal = 20.dp))
@@ -200,14 +247,12 @@ fun QueuesPage(
 internal fun FeedsPage(
     snapshot: LibrarySnapshot,
     refreshing: Boolean,
-    importing: Boolean,
     unassignedOnly: Boolean,
     onUnassignedOnly: () -> Unit,
     favoritesOnly: Boolean,
     onFavoritesOnly: () -> Unit,
     order: FeedOrder,
     onOrder: (FeedOrder) -> Unit,
-    onImport: () -> Unit,
     onAdd: () -> Unit,
     onOpen: (Subscription) -> Unit,
     onManage: (Subscription) -> Unit,
@@ -217,9 +262,6 @@ internal fun FeedsPage(
 ) {
     Column(modifier) {
         PageHeading("フィード") {
-            OutlinedButton(onImport, enabled = !importing, contentPadding = PaddingValues(horizontal = 16.dp)) {
-                Text(if (importing) "読込中" else "インポート")
-            }
             Button(onAdd) { Text("追加") }
         }
         if (snapshot.subscriptions.isNotEmpty()) {
@@ -242,7 +284,7 @@ internal fun FeedsPage(
             }, locale)
         }
         if (snapshot.subscriptions.isEmpty()) {
-            EmptyState("フィードがありません", "URLを入力するか、OPMLをインポートして追加できます。")
+            EmptyState("フィードがありません", null)
         } else if (feeds.isEmpty()) {
             EmptyState("条件に合うフィードはありません", null)
         } else {
@@ -252,7 +294,7 @@ internal fun FeedsPage(
                 items(feeds, key = { it.id }) { feed ->
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                         Column(
-                            Modifier.weight(1f).clickable(role = Role.Button) { onOpen(feed) }
+                            Modifier.weight(1f).clickable(role = Role.Button, onClickLabel = "フィードの詳細を開く") { onOpen(feed) }
                                 .padding(horizontal = 20.dp, vertical = 16.dp),
                             verticalArrangement = Arrangement.spacedBy(4.dp),
                         ) {
@@ -289,7 +331,7 @@ internal fun FeedsPage(
                             if (!refreshing) add("今すぐ更新" to { onRefresh(feed) })
                             add("購読を解除" to { onDelete(feed) })
                         }
-                        RowMenu("フィードの操作", actions)
+                        RowMenu("「${feed.title}」の操作", actions)
                         Spacer(Modifier.width(12.dp))
                     }
                     HorizontalDivider(Modifier.padding(horizontal = 20.dp))
@@ -314,7 +356,7 @@ private fun FeedOrderMenu(order: FeedOrder, onOrder: (FeedOrder) -> Unit) {
                     expanded = false
                 },
                 modifier = Modifier.semantics { selected = choice == order },
-                trailingIcon = if (choice == order) { { Text("✓") } } else null,
+                trailingIcon = if (choice == order) { { Text("✓", Modifier.semantics { hideFromAccessibility() }) } } else null,
             )
         }
     }
@@ -399,8 +441,10 @@ fun AddFeedPage(
             )
         }
         item { Button(onClick = ::search, enabled = url.isNotBlank() && !busy) { Text("登録候補を確認") } }
-        if (busy) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
-        error?.let { message -> item { Text(message, color = MaterialTheme.colorScheme.error) } }
+        if (busy) item {
+            LinearProgressIndicator(Modifier.fillMaxWidth().semantics { contentDescription = "フィードを処理中" })
+        }
+        error?.let { message -> item { Text(message, Modifier.announceStatus(), color = MaterialTheme.colorScheme.error) } }
         items(found.feeds, key = { it.url }) { feed ->
             val existing = feed.url in subscribedUrls
             OutlinedCard(Modifier.fillMaxWidth()) {
@@ -469,7 +513,7 @@ fun QueueNameDialog(editor: QueueEditor, onDismiss: () -> Unit, onSave: suspend 
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
                     keyboardActions = KeyboardActions(onDone = { save() }),
                 )
-                failure?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+                failure?.let { Text(it, Modifier.announceStatus(), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
             }
         },
         confirmButton = { TextButton(::save, enabled = name.isNotBlank() && !saving) { Text("保存") } },
@@ -478,52 +522,98 @@ fun QueueNameDialog(editor: QueueEditor, onDismiss: () -> Unit, onSave: suspend 
 }
 
 @Composable
-fun QueueMembershipDialog(
+internal fun QueueMembershipDialog(
     feed: Subscription,
     queues: List<FeedQueue>,
     onDismiss: () -> Unit,
     onCreateQueue: () -> Unit,
-    onSave: (Set<Long>) -> Unit,
+    onSave: suspend (Set<Long>, Map<Long, KeywordFilter>) -> String?,
 ) {
     var selected by remember(feed.id) { mutableStateOf(feed.queueIds) }
+    var filters by remember(feed.id) { mutableStateOf(feed.queueKeywordFilters) }
+    var editingQueue by remember(feed.id) { mutableStateOf<FeedQueue?>(null) }
     var saving by remember(feed.id) { mutableStateOf(false) }
+    var failure by remember(feed.id) { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+    val selectedFilters = filters.filterKeys { it in selected }
+
+    editingQueue?.let { queue ->
+        KeywordFilterDialog(
+            scopeLabel = queue.name,
+            initial = filters[queue.id],
+            replaceMessage = if (feed.keywordFilter != null) "キュー設定を保存すると、フィード全体のフィルターを解除します。" else null,
+            onDismiss = { editingQueue = null },
+            onSave = { rule ->
+                filters = if (rule == null) filters - queue.id else filters + (queue.id to rule)
+                editingQueue = null
+                null
+            },
+        )
+        return
+    }
+
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = { if (!saving) onDismiss() },
         title = { Text("キューを設定") },
         text = {
             Column {
                 Text(feed.title, style = MaterialTheme.typography.titleSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
                 Spacer(Modifier.height(8.dp))
                 if (queues.isEmpty()) {
-                    Text("キューを作成すると、このフィードを登録できます。")
+                    Text("キューがありません。")
                 } else {
                     LazyColumn(Modifier.heightIn(max = 300.dp)) {
                         items(queues, key = { it.id }) { queue ->
                             val checked = queue.id in selected
-                            Row(
-                                Modifier.fillMaxWidth().heightIn(min = 48.dp)
-                                    .toggleable(checked, role = Role.Checkbox) { value ->
-                                        selected = if (value) selected + queue.id else selected - queue.id
-                                    },
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                            ) {
-                                Checkbox(checked, onCheckedChange = null)
-                                Text(queue.name)
+                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                Row(
+                                    Modifier.weight(1f).heightIn(min = 48.dp)
+                                        .toggleable(checked, enabled = !saving, role = Role.Checkbox) { value ->
+                                            selected = if (value) selected + queue.id else selected - queue.id
+                                        },
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    Checkbox(checked, onCheckedChange = null, enabled = !saving)
+                                    Text(queue.name)
+                                }
+                                if (checked) {
+                                    TextButton(onClick = { editingQueue = queue }, enabled = !saving) {
+                                        Text(filters[queue.id]?.summary ?: "フィルター")
+                                    }
+                                }
                             }
                         }
                     }
+                    if (feed.keywordFilter != null && selectedFilters.isNotEmpty()) {
+                        Text(
+                            "保存すると、フィード全体のフィルターを解除します。",
+                            Modifier.announceStatus(),
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
                 }
+                failure?.let { Text(it, Modifier.announceStatus(), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
             }
         },
         confirmButton = {
             if (queues.isEmpty()) {
                 TextButton(onCreateQueue) { Text("キューを作成") }
             } else {
-                TextButton(onClick = { saving = true; onSave(selected) }, enabled = !saving) { Text("保存") }
+                TextButton(onClick = {
+                    if (saving) return@TextButton
+                    saving = true
+                    scope.launch {
+                        try {
+                            failure = onSave(selected, selectedFilters)
+                        } finally {
+                            saving = false
+                        }
+                    }
+                }, enabled = !saving) { Text("保存") }
             }
         },
-        dismissButton = { TextButton(onDismiss) { Text("キャンセル") } },
+        dismissButton = { TextButton(onDismiss, enabled = !saving) { Text("キャンセル") } },
     )
 }
 
@@ -536,7 +626,7 @@ internal fun PageHeading(title: String, action: @Composable () -> Unit) {
     ) {
         Text(
             title,
-            Modifier.align(Alignment.CenterVertically),
+            Modifier.align(Alignment.CenterVertically).semantics { heading() },
             style = MaterialTheme.typography.headlineMedium,
             fontFamily = FontFamily.Serif,
             maxLines = 2,

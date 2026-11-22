@@ -3,6 +3,7 @@ package io.github.sasakiy84.qarry
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
 import org.junit.Test
+import javax.xml.parsers.DocumentBuilderFactory
 
 class OpmlTest {
     @Test
@@ -51,5 +52,34 @@ class OpmlTest {
         assertThrows(OpmlFormatException::class.java) {
             readOpml("<rss><channel><title>Feed</title></channel></rss>".byteInputStream())
         }
+    }
+
+    @Test
+    fun exportedOpmlIsValidXmlAndPreservesJapaneseNamesUrlsAndWebsiteScopes() {
+        val subscriptions = listOf(
+            OpmlFeed("https://example.com/feed?id=1&lang=ja", "研究 & ニュース <新着> \"RSS\"", "https://example.com/"),
+            OpmlFeed("https://example.com/news", "Webページの監視", "https://example.com/news", "main > article:nth-child(2)"),
+        )
+        val bytes = encodeOpml(subscriptions)
+        val xml = DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(bytes.inputStream())
+        assertEquals("opml", xml.documentElement.tagName)
+        assertEquals("2.0", xml.documentElement.getAttribute("version"))
+        assertEquals(subscriptions, readOpml(bytes.inputStream()).feeds)
+        assertEquals(OpmlContents(emptyList(), 0, 0), readOpml(encodeOpml(emptyList()).inputStream()))
+    }
+
+    @Test
+    fun importIgnoresGenericWebLinksAndCountsInvalidQarryWebsiteScopes() {
+        val subscriptions = listOf(
+            OpmlFeed("https://example.com/regex", "Unsafe pattern", htmlItemSelector = "main:matches((a+)+)"),
+            OpmlFeed("https://example.com/invalid", "Bad selector", htmlItemSelector = ">"),
+        )
+        assertEquals(OpmlContents(emptyList(), 0, 2), readOpml(encodeOpml(subscriptions).inputStream()))
+        val links = """
+            <opml version="2.0"><body>
+              <outline type="link" url="https://example.com/" text="Web bookmark"/>
+            </body></opml>
+        """.trimIndent()
+        assertEquals(OpmlContents(emptyList(), 0, 0), readOpml(links.byteInputStream()))
     }
 }

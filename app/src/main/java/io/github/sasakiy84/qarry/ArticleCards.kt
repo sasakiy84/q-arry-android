@@ -3,7 +3,7 @@ package io.github.sasakiy84.qarry
 import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyListScope
@@ -34,21 +34,41 @@ import kotlin.math.roundToInt
 
 internal fun LazyListScope.articleCards(
     articles: List<Article>,
-    onArticle: (Article) -> Unit,
+    onArticle: (Article, ArticlePress) -> Unit,
     onDismiss: suspend (Article, ArticleRating?) -> Boolean,
     history: Boolean = false,
 ) {
     items(articles, key = { it.id }) { article ->
-        ArticleCard(article, history, { onArticle(article) }, onDismiss)
+        ArticleCard(article, history, { press -> onArticle(article, press) }, onDismiss)
         HorizontalDivider(Modifier.padding(horizontal = 20.dp))
     }
+}
+
+@Composable
+internal fun Modifier.articleOpenActions(
+    url: String?, onOpen: (ArticlePress) -> Unit, hasArticleDetail: Boolean = true,
+): Modifier {
+    val hasUrl = url?.let(::webUrl) != null
+    val tap = when {
+        !hasArticleDetail -> ArticleOpenMode.Browser
+        !hasUrl -> ArticleOpenMode.InApp
+        else -> LocalArticleOpenMode.current
+    }
+    val canOpenEitherWay = hasArticleDetail && hasUrl
+    return combinedClickable(
+        role = Role.Button,
+        onClickLabel = tap.actionLabel,
+        onClick = { onOpen(ArticlePress.Tap) },
+        onLongClickLabel = tap.forPress(ArticlePress.LongPress).actionLabel.takeIf { canOpenEitherWay },
+        onLongClick = if (canOpenEitherWay) ({ onOpen(ArticlePress.LongPress) }) else null,
+    )
 }
 
 @Composable
 private fun ArticleCard(
     article: Article,
     history: Boolean,
-    onOpen: () -> Unit,
+    onOpen: (ArticlePress) -> Unit,
     onDismiss: suspend (Article, ArticleRating?) -> Boolean,
 ) {
     if (article.dismissed) {
@@ -126,8 +146,9 @@ private fun ArticleCard(
                 Modifier.matchParentSize().background(background).padding(horizontal = 24.dp).clearAndSetSemantics { },
                 contentAlignment = if (good) AbsoluteAlignment.CenterLeft else AbsoluteAlignment.CenterRight,
             ) {
+                val label = if (good) ArticleRating.Good.label else ArticleRating.Bad.label
                 Text(
-                    if (good) ArticleRating.Good.label else ArticleRating.Bad.label,
+                    if (ready) "$label ✓" else label,
                     color = textColor, style = MaterialTheme.typography.titleMedium,
                 )
             }
@@ -147,22 +168,27 @@ private fun ArticleCard(
 private fun ArticleCardContent(
     article: Article,
     history: Boolean,
-    onOpen: () -> Unit,
+    onOpen: (ArticlePress) -> Unit,
     onRemove: (() -> Unit)?,
     onRate: ((ArticleRating) -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
+    val metadata = rememberArticleMetadata(article.url)
+    val image = rememberArticleImage(metadata?.imageUrl, article.thumbnailUrl)
     val typography = MaterialTheme.typography
+    val largeText = LocalDensity.current.fontScale >= 1.5f
+    val title = metadata?.title ?: article.displayTitle
+    val titleLines = if (largeText) 2 else 1
     val height = with(LocalDensity.current) {
-        typography.labelMedium.lineHeight.toDp() + typography.titleMedium.lineHeight.toDp() +
+        typography.labelMedium.lineHeight.toDp() + typography.titleMedium.lineHeight.toDp() * titleLines +
             typography.bodySmall.lineHeight.toDp() * 2 + typography.bodySmall.fontSize.toDp()
     } + 32.dp
     Row(
-        modifier.fillMaxWidth().height(height).background(MaterialTheme.colorScheme.surface)
-            .clickable(role = Role.Button, onClick = onOpen)
+        modifier.fillMaxWidth().heightIn(min = height).background(MaterialTheme.colorScheme.surface)
+            .articleOpenActions(article.url, onOpen)
             .semantics {
                 if (onRate != null) customActions = ArticleRating.entries.map { rating ->
-                    CustomAccessibilityAction(rating.label) {
+                    CustomAccessibilityAction("${rating.label} と評価してすべてのキューから外す") {
                         onRate(rating)
                         true
                     }
@@ -196,21 +222,21 @@ private fun ArticleCardContent(
                 }
             }
             Text(
-                article.displayTitle, style = typography.titleMedium,
+                title, style = typography.titleMedium,
                 fontWeight = if (article.read) FontWeight.Medium else FontWeight.SemiBold,
-                maxLines = 1, overflow = TextOverflow.Ellipsis,
+                maxLines = titleLines, overflow = TextOverflow.Ellipsis,
             )
-            article.body?.let { description ->
+            (metadata?.description ?: article.body)?.let { description ->
                 Text(
                     description.trim(), style = typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 2, overflow = TextOverflow.Ellipsis,
                 )
             }
         }
-        ArticleThumbnail(article.url, article.thumbnailUrl, Modifier.size(width = 76.dp, height = 60.dp))
+        ArticleThumbnail(image, if (largeText) Modifier.size(48.dp) else Modifier.size(width = 76.dp, height = 60.dp))
         if (onRemove != null) {
             IconButton(onClick = onRemove) {
-                Icon(painterResource(R.drawable.ic_delete), contentDescription = "すべてのキューから削除")
+                Icon(painterResource(R.drawable.ic_delete), contentDescription = "「$title」をすべてのキューから削除")
             }
         } else {
             Spacer(Modifier.width(48.dp))

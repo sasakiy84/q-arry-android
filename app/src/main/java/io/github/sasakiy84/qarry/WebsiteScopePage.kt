@@ -1,6 +1,7 @@
 package io.github.sasakiy84.qarry
 
 import android.annotation.SuppressLint
+import android.view.View
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -15,6 +16,10 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.hideFromAccessibility
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -32,12 +37,17 @@ internal fun WebsiteScopePage(
 ) {
     var selectedIndex by rememberSaveable(website.options.first().feed.url) { mutableIntStateOf(0) }
     val selected = website.options[selectedIndex.coerceIn(website.options.indices)]
+    val largeText = LocalDensity.current.fontScale >= 1.5f
     BackHandler { if (!busy) onChangeUrl() }
     Column(modifier) {
-        WebsitePreview(website.html, selected.highlightIds, Modifier.fillMaxWidth().weight(1f))
+        WebsitePreview(website.html, selected.highlightIds, Modifier.fillMaxWidth().weight(if (largeText) 0.5f else 1f))
         HorizontalDivider()
         Column(Modifier.fillMaxWidth().weight(1f)) {
-            Text("登録する範囲", Modifier.padding(start = 20.dp, top = 12.dp), style = MaterialTheme.typography.titleSmall)
+            Text(
+                "登録する範囲",
+                Modifier.padding(start = 20.dp, top = 12.dp).semantics { heading() },
+                style = MaterialTheme.typography.titleSmall,
+            )
             LazyRow(
                 contentPadding = PaddingValues(horizontal = 20.dp, vertical = 3.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -52,7 +62,7 @@ internal fun WebsiteScopePage(
                             Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                                 Text(
                                     option.label, Modifier.weight(1f, fill = false),
-                                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                    maxLines = if (largeText) 2 else 1, overflow = TextOverflow.Ellipsis,
                                 )
                                 Text("${option.feed.articles.size}件", maxLines = 1)
                             }
@@ -69,7 +79,10 @@ internal fun WebsiteScopePage(
                                 Modifier.fillMaxWidth().padding(vertical = 8.dp),
                                 verticalArrangement = Arrangement.spacedBy(4.dp),
                             ) {
-                                Text("クエリパス（CSSセレクター）", style = MaterialTheme.typography.labelMedium)
+                                Text(
+                                    "クエリパス（CSSセレクター）", Modifier.semantics { heading() },
+                                    style = MaterialTheme.typography.labelMedium,
+                                )
                                 SelectionContainer {
                                     Text(
                                         selector,
@@ -103,13 +116,13 @@ internal fun WebsiteScopePage(
                 }
             }
             error?.let {
-                Text(it, Modifier.padding(horizontal = 20.dp), color = MaterialTheme.colorScheme.error,
+                Text(it, Modifier.padding(horizontal = 20.dp).announceStatus(), color = MaterialTheme.colorScheme.error,
                     style = MaterialTheme.typography.bodySmall)
             }
-            Row(
+            FlowRow(
                 Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
+                itemVerticalAlignment = Alignment.CenterVertically,
             ) {
                 TextButton(onChangeUrl, enabled = !busy) { Text("URLを変更") }
                 Button(
@@ -130,6 +143,10 @@ private fun WebsitePreview(html: String, highlightIds: List<Int>, modifier: Modi
     AndroidView(
         factory = { context ->
             WebView(context).apply {
+                // The native list below exposes the selected articles in reading order.
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+                isFocusableInTouchMode = false
+                isFocusable = false
                 settings.apply {
                     // The preview contains sanitized, local HTML. JavaScript only updates the selection.
                     javaScriptEnabled = true
@@ -147,7 +164,7 @@ private fun WebsitePreview(html: String, highlightIds: List<Int>, modifier: Modi
                 loadDataWithBaseURL(null, html, "text/html", "UTF-8", null)
             }
         },
-        modifier = modifier,
+        modifier = modifier.semantics { hideFromAccessibility() },
         onRelease = { it.destroy() },
         update = { view ->
             if (ready && view.tag != highlightIds) {

@@ -29,6 +29,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import java.io.IOException
 import java.io.InputStream
+import java.io.OutputStream
 
 class QarryApplication : Application() {
     val library: FeedLibrary by lazy {
@@ -87,16 +88,16 @@ class FeedLibrary(private val store: FeedStore, private val client: FeedClient) 
     private val activeRefresh = MutableStateFlow(false)
     val refreshing = activeRefresh.asStateFlow()
     private val refreshLock = Mutex()
-    private val thumbnailLookups = LruCache<String, ThumbnailLookup>(256)
-    private val thumbnailConnections = Semaphore(3)
+    private val metadataLookups = LruCache<String, MetadataLookup>(256)
+    private val metadataConnections = Semaphore(3)
 
     suspend fun load(queueId: Long?, unreadOnly: Boolean, limit: Int): LibrarySnapshot =
         runInterruptible(Dispatchers.IO) { store.load(queueId, unreadOnly, limit) }
 
     suspend fun article(id: Long): Article? = runInterruptible(Dispatchers.IO) { store.article(id) }
 
-    suspend fun feedArticles(feedId: Long, limit: Int): ArticleListing =
-        runInterruptible(Dispatchers.IO) { store.feedArticles(feedId, limit) }
+    suspend fun feedArticles(feedId: Long, limit: Int, applyKeywordFilter: Boolean = true): ArticleListing =
+        runInterruptible(Dispatchers.IO) { store.feedArticles(feedId, limit, applyKeywordFilter) }
 
     suspend fun history(limit: Int): ArticleListing =
         runInterruptible(Dispatchers.IO) { store.history(limit) }
@@ -104,19 +105,19 @@ class FeedLibrary(private val store: FeedStore, private val client: FeedClient) 
     internal suspend fun ratingHistory(limit: Int): RatingListing =
         runInterruptible(Dispatchers.IO) { store.ratingHistory(limit) }
 
-    suspend fun articleThumbnail(url: String): String? = thumbnailConnections.withPermit {
-        thumbnailLookups.get(url)?.takeIf { it.expiresAt > SystemClock.elapsedRealtime() }
-            ?.let { return@withPermit it.imageUrl }
-        val imageUrl = runInterruptible(Dispatchers.IO) {
+    internal suspend fun articleMetadata(url: String): ArticleMetadata? = metadataConnections.withPermit {
+        metadataLookups.get(url)?.takeIf { it.expiresAt > SystemClock.elapsedRealtime() }
+            ?.let { return@withPermit it.metadata }
+        val metadata = runInterruptible(Dispatchers.IO) {
             try {
-                client.articleThumbnail(url)
-            } catch (_: FeedRequestException) {
+                client.articleMetadata(url)
+            } catch (_: IOException) {
                 if (Thread.currentThread().isInterrupted) throw InterruptedException()
                 null
             }
         }
-        thumbnailLookups.put(url, ThumbnailLookup(imageUrl, SystemClock.elapsedRealtime() + THUMBNAIL_LOOKUP_TTL))
-        imageUrl
+        metadataLookups.put(url, MetadataLookup(metadata, SystemClock.elapsedRealtime() + METADATA_LOOKUP_TTL))
+        metadata
     }
 
     internal suspend fun search(url: String): FeedDiscovery =
@@ -134,23 +135,34 @@ class FeedLibrary(private val store: FeedStore, private val client: FeedClient) 
         )
     }
 
+    internal suspend fun exportOpml(openOutput: () -> OutputStream?): Int = runInterruptible(Dispatchers.IO) {
+        val feeds = store.subscriptions().map { OpmlFeed(it.url, it.title, it.homeUrl, it.htmlItemSelector) }
+        val document = encodeOpml(feeds)
+        val output = openOutput() ?: throw IOException("OPML output stream unavailable")
+        output.use { it.write(document) }
+        feeds.size
+    }
+
     suspend fun subscribe(document: FeedDocument, queueId: Long?): Long = change {
         store.subscribe(document, queueId).also {
             Log.i(FEED_LOG, "Subscribed feed=$it entries=${document.articles.size}")
         }
     }
 
-    suspend fun setMembership(feedId: Long, queueIds: Set<Long>): Unit = change {
-        store.setMembership(feedId, queueIds).also {
+    suspend fun setMembership(feedId: Long, queueIds: Set<Long>, keywordFilters: Map<Long, KeywordFilter>): Unit = change {
+        store.setMembership(feedId, queueIds, keywordFilters).also {
             Log.i(FEED_LOG, "Assigned feed=$feedId queues=${queueIds.size}")
         }
     }
+
+    suspend fun setFeedKeywordFilter(feedId: Long, rule: KeywordFilter?): Unit = change { store.setFeedKeywordFilter(feedId, rule) }
 
     suspend fun nameQueue(id: Long?, name: String): Boolean = change { store.queueName(id, name) }
     suspend fun removeQueue(id: Long): Unit = change { store.removeQueue(id) }
     suspend fun removeFeed(id: Long): Unit = change { store.removeFeed(id) }
     suspend fun setFeedFavorite(id: Long, favorite: Boolean): Unit = change { store.setFeedFavorite(id, favorite) }
     suspend fun markRead(id: Long, read: Boolean): Unit = change { store.setRead(id, read) }
+    suspend fun markAllRead(queueId: Long?): Int = change { store.markAllRead(queueId) }
     suspend fun recordView(id: Long): Unit = change { store.recordView(id) }
     suspend fun dismissArticle(id: Long, rating: ArticleRating?): Unit = change { store.dismissArticle(id, rating) }
     internal suspend fun changeRating(key: RatingKey, rating: ArticleRating?): Unit = change { store.changeRating(key, rating) }
@@ -209,5 +221,5 @@ fun Context.feedLibrary(): FeedLibrary = (applicationContext as QarryApplication
 
 private const val FEED_LOG = "QarryFeeds"
 private const val REFRESH_JOB = 241
-private const val THUMBNAIL_LOOKUP_TTL = 30 * 60 * 1_000L
-private data class ThumbnailLookup(val imageUrl: String?, val expiresAt: Long)
+private const val METADATA_LOOKUP_TTL = 30 * 60 * 1_000L
+private data class MetadataLookup(val metadata: ArticleMetadata?, val expiresAt: Long)

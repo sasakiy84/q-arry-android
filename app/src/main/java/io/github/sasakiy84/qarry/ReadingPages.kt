@@ -1,30 +1,26 @@
 package io.github.sasakiy84.qarry
 
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import java.net.URI
-
-@Composable
-internal fun SwipeHint() {
-    Text(
-        "右に引いて離すと Good、左は Bad",
-        Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-        style = MaterialTheme.typography.labelMedium,
-    )
-}
 
 internal fun LazyListScope.moreArticles(onMore: () -> Unit) {
     item {
@@ -32,48 +28,61 @@ internal fun LazyListScope.moreArticles(onMore: () -> Unit) {
     }
 }
 
-internal enum class HistoryTab(val label: String) {
+internal enum class SettingsTab(val label: String) {
+    General("一般"),
     Viewed("閲覧履歴"),
     Rated("評価履歴"),
 }
 
+internal enum class OpmlTransfer { Importing, Exporting }
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun HistoryPage(
-    tab: HistoryTab,
-    onTab: (HistoryTab) -> Unit,
+internal fun SettingsPage(
+    tab: SettingsTab,
+    onTab: (SettingsTab) -> Unit,
+    articleOpenMode: ArticleOpenMode,
+    onArticleOpenMode: (ArticleOpenMode) -> Unit,
+    transfer: OpmlTransfer?,
+    choosingFile: Boolean,
+    onImport: () -> Unit,
+    onExport: () -> Unit,
     viewed: ArticleListing?,
     rated: RatingListing?,
-    onArticle: (Article) -> Unit,
-    onRatedArticle: (RatedArticle) -> Unit,
+    onArticle: (Article, ArticlePress) -> Unit,
+    onRatedArticle: (RatedArticle, ArticlePress) -> Unit,
     onDismiss: suspend (Article, ArticleRating?) -> Boolean,
     onChangeRating: (RatingKey, ArticleRating?) -> Unit,
     onMore: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(modifier) {
-        PageHeading("履歴") { }
+        PageHeading("設定") { }
         PrimaryTabRow(selectedTabIndex = tab.ordinal) {
-            for (choice in HistoryTab.entries) {
+            for (choice in SettingsTab.entries) {
                 Tab(selected = tab == choice, onClick = { onTab(choice) }, text = { Text(choice.label) })
             }
         }
-        HorizontalDivider()
         when (tab) {
-            HistoryTab.Viewed -> when {
-                viewed == null -> CircularProgressIndicator(Modifier.padding(28.dp))
-                viewed.articles.isEmpty() -> EmptyState("閲覧履歴はありません", "記事を開くと、ここに表示されます。")
+            SettingsTab.General -> Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
+                ArticleOpeningSettings(articleOpenMode, onArticleOpenMode)
+                HorizontalDivider(Modifier.padding(horizontal = 20.dp))
+                FeedTransferSettings(transfer, choosingFile, onImport, onExport)
+            }
+            SettingsTab.Viewed -> when {
+                viewed == null -> LoadingIndicator("閲覧履歴を読み込み中")
+                viewed.articles.isEmpty() -> EmptyState("閲覧履歴はありません", null)
                 else -> LazyColumn(contentPadding = PaddingValues(bottom = 24.dp)) {
                     articleCards(viewed.articles, onArticle, onDismiss, history = true)
                     if (viewed.hasMore) moreArticles(onMore)
                 }
             }
-            HistoryTab.Rated -> when {
-                rated == null -> CircularProgressIndicator(Modifier.padding(28.dp))
-                rated.articles.isEmpty() -> EmptyState("評価履歴はありません", "Good や Bad を記録した記事がここに表示されます。")
+            SettingsTab.Rated -> when {
+                rated == null -> LoadingIndicator("評価履歴を読み込み中")
+                rated.articles.isEmpty() -> EmptyState("評価履歴はありません", null)
                 else -> LazyColumn(contentPadding = PaddingValues(bottom = 24.dp)) {
                     items(rated.articles, key = { "${it.key.feedUrl}\n${it.key.entryKey}" }) { entry ->
-                        RatingHistoryRow(entry, { onRatedArticle(entry) }, { onChangeRating(entry.key, it) })
+                        RatingHistoryRow(entry, { onRatedArticle(entry, it) }, { onChangeRating(entry.key, it) })
                         HorizontalDivider(Modifier.padding(horizontal = 20.dp))
                     }
                     if (rated.hasMore) moreArticles(onMore)
@@ -84,16 +93,66 @@ internal fun HistoryPage(
 }
 
 @Composable
-private fun RatingHistoryRow(entry: RatedArticle, onOpen: () -> Unit, onChange: (ArticleRating?) -> Unit) {
+private fun ArticleOpeningSettings(mode: ArticleOpenMode, onChange: (ArticleOpenMode) -> Unit) {
+    Column(Modifier.fillMaxWidth().padding(vertical = 20.dp)) {
+        Text(
+            "記事カードのタップ",
+            Modifier.padding(horizontal = 20.dp).semantics { heading() },
+            style = MaterialTheme.typography.titleMedium,
+        )
+        Column(Modifier.padding(top = 8.dp).selectableGroup()) {
+            for (choice in ArticleOpenMode.entries) {
+                val selected = mode == choice
+                Row(
+                    Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                        .selectable(selected, role = Role.RadioButton, onClick = { onChange(choice) })
+                        .padding(horizontal = 20.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    RadioButton(selected = selected, onClick = null)
+                    Text(choice.label, style = MaterialTheme.typography.bodyLarge)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FeedTransferSettings(
+    transfer: OpmlTransfer?, choosingFile: Boolean, onImport: () -> Unit, onExport: () -> Unit,
+) {
+    val enabled = transfer == null && !choosingFile
+    Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("フィードの移行（OPML）", Modifier.semantics { heading() }, style = MaterialTheme.typography.titleMedium)
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            OutlinedButton(onImport, enabled = enabled) {
+                Text(if (transfer == OpmlTransfer.Importing) "読込中" else "インポート")
+            }
+            OutlinedButton(onExport, enabled = enabled) {
+                Text(if (transfer == OpmlTransfer.Exporting) "保存中" else "エクスポート")
+            }
+        }
+    }
+}
+
+@Composable
+private fun RatingHistoryRow(entry: RatedArticle, onOpen: (ArticlePress) -> Unit, onChange: (ArticleRating?) -> Unit) {
+    val metadata = rememberArticleMetadata(entry.url)
+    val image = rememberArticleImage(metadata?.imageUrl, entry.thumbnailUrl)
     val canOpen = entry.articleId != null || entry.url?.let(::webUrl) != null
+    val largeText = LocalDensity.current.fontScale >= 1.5f
     ListItem(
-        headlineContent = { Text(entry.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+        headlineContent = { Text(metadata?.title ?: entry.title, maxLines = if (largeText) 2 else 1, overflow = TextOverflow.Ellipsis) },
         overlineContent = { Text(entry.feedTitle, maxLines = 1, overflow = TextOverflow.Ellipsis) },
         supportingContent = { Text(entryDate(entry.ratedAt)) },
         trailingContent = {
-            ArticleThumbnail(entry.url, entry.thumbnailUrl, Modifier.size(width = 76.dp, height = 60.dp))
+            ArticleThumbnail(image, if (largeText) Modifier.size(48.dp) else Modifier.size(width = 76.dp, height = 60.dp))
         },
-        modifier = if (canOpen) Modifier.clickable(role = Role.Button, onClick = onOpen) else Modifier,
+        modifier = if (canOpen) Modifier.articleOpenActions(entry.url, onOpen, entry.articleId != null) else Modifier,
     )
     FlowRow(
         Modifier.padding(start = 20.dp, end = 12.dp, bottom = 8.dp),
@@ -123,10 +182,13 @@ internal fun FeedDetailPage(
     onLink: (String) -> Unit,
     onQueue: (Long) -> Unit,
     onManage: () -> Unit,
+    onKeywordFilter: () -> Unit,
+    showingUnfiltered: Boolean,
+    onToggleUnfiltered: () -> Unit,
     onFavoriteChange: (Boolean) -> Unit,
     onRefresh: () -> Unit,
     onUnsubscribe: () -> Unit,
-    onArticle: (Article) -> Unit,
+    onArticle: (Article, ArticlePress) -> Unit,
     onDismiss: suspend (Article, ArticleRating?) -> Boolean,
     onMore: () -> Unit,
     modifier: Modifier = Modifier,
@@ -145,7 +207,7 @@ internal fun FeedDetailPage(
             ) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        feed.title, Modifier.weight(1f),
+                        feed.title, Modifier.weight(1f).semantics { heading() },
                         style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold,
                     )
                     IconToggleButton(checked = feed.isFavorite, onCheckedChange = onFavoriteChange) {
@@ -181,19 +243,29 @@ internal fun FeedDetailPage(
                 }
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     TextButton(onManage) { Text("キューを設定") }
+                    TextButton(onKeywordFilter) {
+                        Text(feed.keywordFilter?.let { "フィルター（${it.summary}）" } ?: "フィルターを設定")
+                    }
                     TextButton(onRefresh, enabled = !refreshing) { Text("今すぐ更新") }
                     TextButton(onUnsubscribe) { Text("購読を解除") }
                 }
                 feed.error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
             }
             HorizontalDivider()
+            FlowRow(
+                Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                itemVerticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("記事一覧", Modifier.semantics { heading() }, style = MaterialTheme.typography.titleMedium)
+                if (feed.keywordFilter != null) {
+                    FilterChip(showingUnfiltered, onToggleUnfiltered, label = { Text("絞り込み前を表示") })
+                }
+            }
             if (listing.articles.isEmpty()) {
-                EmptyState("表示する記事がありません", null)
-            } else {
-                Text(
-                    "記事一覧", Modifier.padding(start = 20.dp, top = 12.dp, bottom = 4.dp),
-                    style = MaterialTheme.typography.titleMedium,
-                )
+                val message = if (feed.keywordFilter != null && !showingUnfiltered) "絞り込み後の記事がありません"
+                else "表示する記事がありません"
+                EmptyState(message, null)
             }
         }
         articleCards(listing.articles, onArticle, onDismiss)

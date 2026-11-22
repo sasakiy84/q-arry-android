@@ -91,11 +91,15 @@ class FeedClientTest {
     }
 
     @Test
-    fun articleThumbnailUsesSecureMetadataResolvedAgainstTheRedirectedPage() = withServer { server, address ->
+    fun articleMetadataPrefersOpenGraphAndResolvesImagesAgainstTheRedirectedPage() = withServer { server, address ->
         server["/old"] = { Response("", status = "302 Found", location = "/posts/story") }
         server["/posts/story"] = {
             Response(
                 """<head>
+                    <meta name="twitter:title" content="Twitter title">
+                    <meta name="twitter:description" content="Twitter description">
+                    <meta property="og:title" content=" 記事 &amp; ニュース ">
+                    <meta property="og:description" content="記事ページの説明">
                     <meta property="og:image" content="https://publisher.example/general.jpg">
                     <meta property="og:image:secure_url" content="images/story.jpg">
                     <meta name="twitter:image" content="https://publisher.example/share.jpg">
@@ -104,16 +108,21 @@ class FeedClientTest {
             )
         }
         assertEquals(
-            "https://publisher.example/posts/images/story.jpg",
-            fixtureClient(address).articleThumbnail("https://publisher.example/old"),
+            ArticleMetadata("記事 & ニュース", "記事ページの説明", "https://publisher.example/posts/images/story.jpg"),
+            fixtureClient(address).articleMetadata("https://publisher.example/old"),
         )
     }
 
     @Test
-    fun articleThumbnailSkipsPlainHttpAndReturnsNullWithoutUsableMetadata() = withServer { server, address ->
+    fun articleMetadataIgnoresMissingFieldsAndUsesSecureTwitterCardFields() = withServer { server, address ->
         server["/story"] = {
             Response(
-                """<head>
+                """<head><title>Ordinary page title</title>
+                    <meta name="description" content="Ordinary description">
+                    <meta property="og:title" content=" ">
+                    <meta property="og:description" content="　">
+                    <meta name="twitter:title" content="Twitter title">
+                    <meta property="og:image:secure_url" content=" ">
                     <meta property="og:image" content="http://publisher.example/plain.jpg">
                     <meta name="twitter:image" content="//cdn.example/share.jpg">
                 </head>""".trimIndent(),
@@ -128,9 +137,12 @@ class FeedClientTest {
             )
         }
         val client = fixtureClient(address)
-        assertEquals("https://cdn.example/share.jpg", client.articleThumbnail("https://publisher.example/story"))
-        assertNull(client.articleThumbnail("https://publisher.example/no-image"))
-        assertNull(client.articleThumbnail("http://publisher.example/story"))
+        assertEquals(
+            ArticleMetadata("Twitter title", null, "https://cdn.example/share.jpg"),
+            client.articleMetadata("https://publisher.example/story"),
+        )
+        assertNull(client.articleMetadata("https://publisher.example/no-image"))
+        assertNull(client.articleMetadata("http://publisher.example/story"))
     }
 
     @Test

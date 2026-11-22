@@ -11,6 +11,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.SQLiteMode
+import java.io.ByteArrayOutputStream
 import java.util.Locale
 
 @RunWith(RobolectricTestRunner::class)
@@ -95,6 +96,32 @@ class FeedStoreTest {
         assertEquals("新しいフィード", imported.title)
         assertNull(imported.refreshedAt)
         assertEquals("First article", snapshot.articles.single().title)
+    }
+
+    @Test
+    fun exportingAndImportingRestoresRssAndWebsiteSubscriptionsIncludingTheSavedSelector() = runBlocking {
+        val rssId = store.subscribe(example, null)
+        val site = example.copy(
+            url = "https://publisher.example/news/",
+            title = "更新のお知らせ",
+            home = "https://publisher.example/news/",
+            htmlItemSelector = "#news > article:nth-child(2)",
+        )
+        val siteId = store.subscribe(site, null)
+        val library = FeedLibrary(store, FeedClient { error("OPML file operations don't require a network connection") })
+        val output = ByteArrayOutputStream()
+        assertEquals(2, library.exportOpml { output })
+
+        store.removeFeed(rssId)
+        store.removeFeed(siteId)
+        val imported = library.importOpml { output.toByteArray().inputStream() }
+        assertEquals(2, imported.feedIds.size)
+        assertEquals(0, imported.unsupportedCount)
+        val restored = store.subscriptions().associateBy { it.url }
+        assertNull(restored.getValue(example.url).htmlItemSelector)
+        assertEquals(example.home, restored.getValue(example.url).homeUrl)
+        assertEquals(site.title, restored.getValue(site.url).title)
+        assertEquals(site.htmlItemSelector, restored.getValue(site.url).htmlItemSelector)
     }
 
     @Test
@@ -285,6 +312,115 @@ class FeedStoreTest {
     }
 
     @Test
+    fun feedFilterMatchesTheOriginalTitleOrDescriptionBeforePagination() {
+        val feedId = store.subscribe(example.copy(articles = listOf(
+            FeedArticle("latest", "キーワードなし", null, "別の記事", 4000),
+            FeedArticle("keyword-in-description", "刊行案内", null, "概要 ".repeat(120) + "図書館", 3000),
+            FeedArticle("keyword-in-title", "Review 100%", null, null, 2000),
+            FeedArticle("ordinary", "Review 100冊", null, null, 1000),
+        )), null)
+        store.queueName(null, "Daily")
+        val queueId = store.load(null, false, 10).queues.single().id
+        store.setMembership(feedId, setOf(queueId))
+        val latestId = store.feedArticles(feedId, 10).articles.first().id
+        store.recordView(latestId)
+
+        store.setFeedKeywordFilter(feedId, KeywordFilter(KeywordFilterMode.Include, listOf("図書館", "review 100%")))
+
+        val listing = store.feedArticles(feedId, 1)
+        assertEquals(listOf("刊行案内"), listing.articles.map { it.title })
+        assertTrue(listing.hasMore)
+        val expected = listOf("刊行案内", "Review 100%")
+        assertEquals(expected, store.load(null, false, 10).articles.map { it.title })
+        assertEquals(expected, store.load(queueId, false, 10).articles.map { it.title })
+        assertEquals(4, store.feedArticles(feedId, 10, applyKeywordFilter = false).articles.size)
+        assertEquals(latestId, store.history(10).articles.single().id)
+        store.setFeedKeywordFilter(feedId, null)
+        assertEquals(4, store.load(queueId, false, 10).articles.size)
+    }
+
+    @Test
+    fun markAllReadUsesTheSelectedArticleListAcrossPages() {
+        store.queueName(null, "Research")
+        val queueId = store.load(null, false, 1).queues.single().id
+        val feedId = store.subscribe(example.copy(articles = listOf(
+            FeedArticle("first", "図書館 1", null, null, 4000),
+            FeedArticle("second", "図書館 2", null, null, 3000),
+            FeedArticle("excluded", "その他", null, null, 2000),
+            FeedArticle("dismissed", "図書館 3", null, null, 1000),
+        )), null)
+        store.subscribe(example.copy(url = "https://other.example/feed"), null)
+        val dismissed = store.feedArticles(feedId, 10).articles.last()
+        store.dismissArticle(dismissed.id, ArticleRating.Bad)
+        val include = KeywordFilter(KeywordFilterMode.Include, listOf("図書館"))
+        store.setMembership(feedId, setOf(queueId), mapOf(queueId to include))
+
+        assertTrue(store.load(queueId, true, 1).hasMore)
+        assertEquals(2, store.markAllRead(queueId))
+        assertTrue(store.load(queueId, true, 10).articles.isEmpty())
+        assertEquals(listOf("その他", "First article"), store.load(null, true, 10).articles.map { it.title })
+        assertEquals(0, store.markAllRead(queueId))
+        assertEquals(2, store.markAllRead(null))
+        assertTrue(store.load(null, true, 10).articles.isEmpty())
+        assertFalse(checkNotNull(store.article(dismissed.id)).read)
+        assertTrue(store.history(10).articles.isEmpty())
+    }
+
+    @Test
+    fun keywordFiltersApplyOnlyToTheSelectedFeedAndQueuePair() {
+        val feedId = store.subscribe(example.copy(articles = listOf(
+            FeedArticle("news", "図書館のニュース", null, null, 3000),
+            FeedArticle("review", "書評", null, null, 2000),
+        )), null)
+        store.queueName(null, "Research")
+        store.queueName(null, "Daily")
+        val (research, daily) = store.load(null, false, 10).queues.map { it.id }
+        store.subscribe(example.copy(url = "https://other.example/feed"), research)
+        val researchFilter = KeywordFilter(KeywordFilterMode.Include, listOf("書評"))
+        val dailyFilter = KeywordFilter(KeywordFilterMode.Exclude, listOf("書評"))
+        store.setMembership(feedId, setOf(research, daily), mapOf(research to researchFilter, daily to dailyFilter))
+
+        assertEquals(listOf("書評", "First article"), store.load(research, false, 10).articles.map { it.title })
+        assertEquals(listOf("図書館のニュース"), store.load(daily, false, 10).articles.map { it.title })
+        assertEquals(3, store.load(null, false, 10).articles.size)
+        assertEquals(2, store.feedArticles(feedId, 10).articles.size)
+
+        store.setMembership(feedId, setOf(research))
+        store.close()
+        store = FeedStore(RuntimeEnvironment.getApplication())
+        assertEquals(mapOf(research to researchFilter), store.subscriptions().single { it.id == feedId }.queueKeywordFilters)
+        store.removeQueue(research)
+        assertTrue(store.subscriptions().single { it.id == feedId }.queueKeywordFilters.isEmpty())
+    }
+
+    @Test
+    fun savingAFilterScopeReplacesTheOtherScopeWithoutChangingMembershipsOrArticles() {
+        val feedId = store.subscribe(example, null)
+        store.queueName(null, "Research")
+        val queueId = store.load(null, false, 10).queues.single().id
+        val rule = KeywordFilter(KeywordFilterMode.Exclude, listOf("First"))
+        store.setMembership(feedId, setOf(queueId), mapOf(queueId to rule))
+
+        store.setFeedKeywordFilter(feedId, rule)
+        var feed = store.subscriptions().single()
+        assertEquals(rule, feed.keywordFilter)
+        assertTrue(feed.queueKeywordFilters.isEmpty())
+        assertEquals(setOf(queueId), feed.queueIds)
+        assertTrue(store.load(null, false, 10).articles.isEmpty())
+
+        store.setMembership(feedId, setOf(queueId), emptyMap())
+        assertEquals(rule, store.subscriptions().single().keywordFilter)
+        store.setMembership(feedId, setOf(queueId), mapOf(queueId to rule))
+        feed = store.subscriptions().single()
+        assertNull(feed.keywordFilter)
+        assertEquals(mapOf(queueId to rule), feed.queueKeywordFilters)
+        assertTrue(store.load(queueId, false, 10).articles.isEmpty())
+
+        store.setMembership(feedId, setOf(queueId), emptyMap())
+        assertEquals("First article", store.load(queueId, false, 10).articles.single().title)
+    }
+
+    @Test
     fun upgradingTheOriginalDatabaseRetainsExistingRssEntriesAndQueueMemberships() {
         assertTrue(store.queueName(null, "Research"))
         val queueId = store.load(null, false, 10).queues.single().id
@@ -293,6 +429,7 @@ class FeedStoreTest {
         store.setRead(articleId, true)
         // Rebuild the original schema without the later feed and article metadata.
         store.writableDatabase.apply {
+            execSQL("DROP TABLE keyword_filter")
             execSQL("DROP INDEX article_viewed")
             execSQL("DROP INDEX article_feed_newest")
             execSQL("DROP TABLE article_feedback")
@@ -326,6 +463,7 @@ class FeedStoreTest {
         )
         val feedId = store.subscribe(website, null)
         store.writableDatabase.apply {
+            execSQL("DROP TABLE keyword_filter")
             execSQL("DROP INDEX article_viewed")
             execSQL("DROP INDEX article_feed_newest")
             execSQL("DROP TABLE article_feedback")
@@ -352,6 +490,7 @@ class FeedStoreTest {
         val articleId = store.feedArticles(feedId, 10).articles.single().id
         store.recordView(articleId)
         store.writableDatabase.apply {
+            execSQL("DROP TABLE keyword_filter")
             execSQL("DROP INDEX article_feed_newest")
             execSQL("ALTER TABLE feed DROP COLUMN is_favorite")
             version = 3
@@ -370,6 +509,7 @@ class FeedStoreTest {
         val feedId = store.subscribe(example, null)
         store.setFeedFavorite(feedId, true)
         store.writableDatabase.apply {
+            execSQL("DROP TABLE keyword_filter")
             execSQL("DROP INDEX article_feed_newest")
             version = 4
         }
@@ -379,5 +519,27 @@ class FeedStoreTest {
         val restored = store.subscriptions().single()
         assertTrue(restored.isFavorite)
         assertEquals(example.articles.single().published, restored.latestArticleAt)
+    }
+
+    @Test
+    fun upgradingVersionFiveKeepsExistingQueuesArticlesAndRatingsWithNoFilters() {
+        store.queueName(null, "Daily")
+        val queueId = store.load(null, false, 10).queues.single().id
+        val feedId = store.subscribe(example, queueId)
+        val articleId = store.load(queueId, false, 10).articles.single().id
+        store.dismissArticle(articleId, ArticleRating.Good)
+        store.writableDatabase.apply {
+            execSQL("DROP TABLE keyword_filter")
+            version = 5
+        }
+        store.close()
+        store = FeedStore(RuntimeEnvironment.getApplication())
+
+        val restored = store.subscriptions().single()
+        assertEquals(feedId, restored.id)
+        assertEquals(setOf(queueId), restored.queueIds)
+        assertNull(restored.keywordFilter)
+        assertTrue(restored.queueKeywordFilters.isEmpty())
+        assertEquals(ArticleRating.Good, store.article(articleId)?.rating)
     }
 }

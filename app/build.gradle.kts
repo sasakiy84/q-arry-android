@@ -54,6 +54,8 @@ android {
         unitTests.isIncludeAndroidResources = true
         unitTests.all {
             it.dependsOn(prepareTestSdk)
+            // Isolate Compose's main dispatcher between Robolectric test classes.
+            it.forkEvery = 1
             it.jvmArgs("--add-exports=java.base/jdk.internal.access=ALL-UNNAMED")
             it.systemProperty("robolectric.offline", "true")
             it.systemProperty("robolectric.dependency.dir", layout.buildDirectory.dir("verified-test-sdk").get().asFile)

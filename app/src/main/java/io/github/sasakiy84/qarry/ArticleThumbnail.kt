@@ -8,6 +8,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -22,24 +23,42 @@ import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 
 @Composable
-fun ArticleThumbnail(
-    articleUrl: String?,
-    thumbnailUrl: String?,
-    modifier: Modifier = Modifier,
-) {
+internal fun rememberArticleMetadata(articleUrl: String?): ArticleMetadata? {
     val library = LocalContext.current.feedLibrary()
-    val directUrl = remember(thumbnailUrl) { httpsUrl(thumbnailUrl) }
     val pageUrl = remember(articleUrl) { httpsUrl(articleUrl) }
-    var directImageFailed by remember(pageUrl, directUrl) { mutableStateOf(false) }
-    var imageLoaded by remember(pageUrl, directUrl) { mutableStateOf(false) }
-    var fallbackUrl by remember(pageUrl, directUrl) { mutableStateOf<String?>(null) }
+    var metadata by remember(library, pageUrl) { mutableStateOf<ArticleMetadata?>(null) }
+    LaunchedEffect(library, pageUrl) {
+        metadata = pageUrl?.let { library.articleMetadata(it) }
+    }
+    return metadata
+}
 
-    LaunchedEffect(library, pageUrl, directUrl, directImageFailed) {
-        if (pageUrl != null && (directUrl == null || directImageFailed)) {
-            fallbackUrl = library.articleThumbnail(pageUrl)?.takeUnless { it == directUrl }
+@Stable
+internal class ArticleImage(preferredUrl: String?, fallbackUrl: String?) {
+    private val preferred = httpsUrl(preferredUrl)
+    private val fallback = httpsUrl(fallbackUrl)?.takeUnless { it == preferred }
+    private var preferredFailed by mutableStateOf(false)
+    private var fallbackFailed by mutableStateOf(false)
+
+    val url: String?
+        get() = preferred?.takeUnless { preferredFailed } ?: fallback?.takeUnless { fallbackFailed }
+
+    fun markFailed(url: String) {
+        when (url) {
+            preferred -> preferredFailed = true
+            fallback -> fallbackFailed = true
         }
     }
+}
 
+@Composable
+internal fun rememberArticleImage(preferredUrl: String?, fallbackUrl: String?): ArticleImage =
+    remember(preferredUrl, fallbackUrl) { ArticleImage(preferredUrl, fallbackUrl) }
+
+@Composable
+internal fun ArticleThumbnail(image: ArticleImage, modifier: Modifier = Modifier) {
+    val imageUrl = image.url
+    var imageLoaded by remember(imageUrl) { mutableStateOf(false) }
     Box(
         modifier.clip(RoundedCornerShape(12.dp)).background(MaterialTheme.colorScheme.surfaceVariant),
         contentAlignment = Alignment.Center,
@@ -52,7 +71,6 @@ fun ArticleThumbnail(
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        val imageUrl = if (directImageFailed) fallbackUrl else directUrl ?: fallbackUrl
         if (imageUrl != null) {
             AsyncImage(
                 model = imageUrl,
@@ -60,10 +78,7 @@ fun ArticleThumbnail(
                 modifier = Modifier.matchParentSize(),
                 contentScale = ContentScale.Crop,
                 onSuccess = { imageLoaded = true },
-                onError = {
-                    imageLoaded = false
-                    if (imageUrl == directUrl) directImageFailed = true
-                },
+                onError = { image.markFailed(imageUrl) },
             )
         }
     }

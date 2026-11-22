@@ -38,6 +38,8 @@ data class FeedArticle(
     val thumbnailUrl: String? = null,
 )
 
+internal data class ArticleMetadata(val title: String?, val description: String?, val imageUrl: String?)
+
 class FeedRequestException(message: String, cause: Throwable? = null) : IOException(message, cause)
 
 class FeedClient(
@@ -101,19 +103,29 @@ class FeedClient(
         return parse(response) ?: throw FeedRequestException("RSS・Atomとして読み込めませんでした。")
     }
 
-    fun articleThumbnail(url: String): String? {
+    internal fun articleMetadata(url: String): ArticleMetadata? {
         val articleUrl = httpsUrl(url) ?: return null
         val head = fetch(articleUrl, articleMetadata = true).parseHtml().head()
-        val images = head.select("meta[content]")
-        for (key in articleImageKeys) {
-            for (image in images) {
-                if (image.attr("property").equals(key, true) || image.attr("name").equals(key, true)) {
-                    httpsUrl(image.absUrl("content"))?.let { return it }
-                }
+        val metadata = head.select("meta[content]")
+        fun firstValue(keys: List<String>, value: (Element) -> String?): String? = keys.firstNotNullOfOrNull { key ->
+            metadata.firstNotNullOfOrNull { meta ->
+                if (meta.attr("property").equals(key, true) || meta.attr("name").equals(key, true)) value(meta) else null
             }
         }
-        return head.select("link[rel=image_src][href]")
+
+        fun textValue(meta: Element): String? = meta.attr("content").trim().takeIf(String::isNotEmpty)
+
+        val title = firstValue(articleTitleKeys, ::textValue)
+        val description = firstValue(articleDescriptionKeys, ::textValue)
+        val imageUrl = firstValue(articleImageKeys) { meta ->
+            meta.attr("content").takeIf(String::isNotBlank)?.let { httpsUrl(meta.absUrl("content")) }
+        } ?: head.select("link[rel=image_src][href]")
             .firstNotNullOfOrNull { httpsUrl(it.absUrl("href")) }
+        return if (title != null || description != null || imageUrl != null) {
+            ArticleMetadata(title, description, imageUrl)
+        } else {
+            null
+        }
     }
 
     private fun tryCandidate(url: String): FeedDocument? {
@@ -221,6 +233,8 @@ private data class FeedResponse(
 private const val MAX_FEED_BYTES = 8 * 1024 * 1024
 private const val MAX_ARTICLE_METADATA_BYTES = 128 * 1024
 private const val MAX_ADVERTISED_FEEDS = 6
+private val articleTitleKeys = listOf("og:title", "twitter:title")
+private val articleDescriptionKeys = listOf("og:description", "twitter:description")
 private val articleImageKeys = listOf("og:image:secure_url", "og:image", "og:image:url", "twitter:image", "twitter:image:src")
 private val schemePrefix = Regex("^[a-zA-Z][a-zA-Z0-9+.-]*://")
 private val charsetPattern = Regex("""(?i)charset\s*=\s*["']?([^\s;"']+)""")
