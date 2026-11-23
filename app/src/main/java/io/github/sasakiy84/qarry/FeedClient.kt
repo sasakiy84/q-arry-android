@@ -8,8 +8,10 @@ import org.jsoup.parser.Parser
 import java.io.ByteArrayInputStream
 import java.io.IOException
 import java.net.HttpURLConnection
+import java.net.SocketTimeoutException
 import java.net.URI
 import java.net.URL
+import java.net.UnknownHostException
 import java.nio.charset.Charset
 import java.security.MessageDigest
 import java.time.Instant
@@ -18,6 +20,7 @@ import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import java.time.format.DateTimeFormatterBuilder
 import java.util.Locale
+import javax.net.ssl.SSLException
 
 data class FeedDocument(
     val url: String,
@@ -183,6 +186,29 @@ class FeedClient(
         modified: String? = null,
         articleMetadata: Boolean = false,
     ): FeedResponse {
+        try {
+            return fetchFollowingRedirects(url, etag, modified, articleMetadata)
+        } catch (error: FeedRequestException) {
+            throw error
+        } catch (error: IOException) {
+            val message = when (error) {
+                is UnknownHostException -> "接続先を見つけられませんでした。"
+                is SocketTimeoutException -> "サイトへの接続がタイムアウトしました。"
+                is SSLException -> "サイトとの安全な接続を確立できませんでした。"
+                else -> "サイトに接続できませんでした。"
+            }
+            throw FeedRequestException(message, error)
+        } catch (error: SecurityException) {
+            throw FeedRequestException("サイトへの接続が許可されていません。", error)
+        }
+    }
+
+    private fun fetchFollowingRedirects(
+        url: String,
+        etag: String?,
+        modified: String?,
+        articleMetadata: Boolean,
+    ): FeedResponse {
         var address = url
         var conditional = true
         val addresses = mutableSetOf<String>()
@@ -191,22 +217,23 @@ class FeedClient(
             if (!address.startsWith("https://")) {
                 throw FeedRequestException("サイトに接続するにはHTTPSのURLが必要です。")
             }
-            val connection = openConnection(address).apply {
-                instanceFollowRedirects = false
-                connectTimeout = 5_000
-                readTimeout = 7_000
-                setRequestProperty("User-Agent", "Q-arry/0.1 (Android feed reader)")
-                setRequestProperty(
-                    "Accept",
-                    if (articleMetadata) "text/html, application/xhtml+xml"
-                    else "application/rss+xml, application/atom+xml, application/xml, text/xml, text/html, */*;q=0.5",
-                )
-                if (conditional) {
-                    etag?.let { setRequestProperty("If-None-Match", it) }
-                    modified?.let { setRequestProperty("If-Modified-Since", it) }
-                }
-            }
+            val connection = openConnection(address)
             try {
+                connection.apply {
+                    instanceFollowRedirects = false
+                    connectTimeout = 5_000
+                    readTimeout = 7_000
+                    setRequestProperty("User-Agent", "Q-arry/0.1 (Android feed reader)")
+                    setRequestProperty(
+                        "Accept",
+                        if (articleMetadata) "text/html, application/xhtml+xml"
+                        else "application/rss+xml, application/atom+xml, application/xml, text/xml, text/html, */*;q=0.5",
+                    )
+                    if (conditional) {
+                        etag?.let { setRequestProperty("If-None-Match", it) }
+                        modified?.let { setRequestProperty("If-Modified-Since", it) }
+                    }
+                }
                 when (val status = connection.responseCode) {
                     301, 302, 303, 307, 308 -> {
                         val next = resolveUrl(address, connection.getHeaderField("Location").orEmpty())
@@ -241,10 +268,6 @@ class FeedClient(
                     }
                     else -> throw FeedRequestException("フィードを取得できませんでした（HTTP $status）。")
                 }
-            } catch (error: FeedRequestException) {
-                throw error
-            } catch (error: IOException) {
-                throw FeedRequestException("サイトに接続できませんでした。", error)
             } finally {
                 connection.disconnect()
             }

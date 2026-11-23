@@ -297,8 +297,11 @@ internal fun FeedDetailPage(
                 }
             }
             if (listing.articles.isEmpty()) {
-                val message = if (feed.keywordFilter != null && !showingUnfiltered) "絞り込み後の記事がありません"
-                else "表示する記事がありません"
+                val message = when {
+                    feed.keywordFilter != null && !showingUnfiltered -> "絞り込み後の記事がありません"
+                    feed.error != null -> "取得済みの記事はありません"
+                    else -> "表示する記事がありません"
+                }
                 EmptyState(message, null, scrollable = false)
             }
         }
