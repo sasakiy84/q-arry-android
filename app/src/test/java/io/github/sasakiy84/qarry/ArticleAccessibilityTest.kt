@@ -48,21 +48,22 @@ class ArticleAccessibilityTest {
     )
 
     @Test
-    fun articleCardExposesOpeningDestinationsAndRatingActionsAtLargeTextSize() {
+    fun articleCardExposesOpeningDestinationsAndSwipeActionsAtLargeTextSize() {
         RuntimeEnvironment.setFontScale(2f)
         val linkedArticle = article.copy(url = "https://127.0.0.1:1/article")
         val presses = mutableListOf<ArticlePress>()
+        val dismissals = mutableListOf<ArticleRating?>()
         withScreen({
             CompositionLocalProvider(LocalArticleOpenMode provides ArticleOpenMode.Browser) {
                 ArticlesPage(
                     LibrarySnapshot(articles = listOf(linkedArticle)), queueId = null, unread = false,
-                    markingRead = false, onQueue = {}, onUnread = {}, onMarkAllRead = {}, onAdd = {}, onMore = {},
+                    markingRead = false, onQueueFilter = { _, _ -> }, onUnread = {}, onMarkAllRead = {}, onAdd = {}, onMore = {},
                     onArticle = { _, press -> presses.add(press) },
-                    onDismiss = { _, _ -> true },
+                    onDismiss = { _, rating -> dismissals.add(rating); true },
                     modifier = Modifier.fillMaxSize(),
                 )
             }
-        }) { _, compose ->
+        }) { decor, compose ->
             assertEquals(2f, compose.density.fontScale)
             val merged = compose.semanticsOwner.rootSemanticsNode.semanticTree()
             assertTrue(merged.any { it.text() == "記事" && SemanticsProperties.Heading in it.config })
@@ -77,10 +78,16 @@ class ArticleAccessibilityTest {
             assertEquals(listOf(ArticlePress.Tap, ArticlePress.LongPress), presses)
             val actions = card.config[SemanticsActions.CustomActions]
             assertEquals(
-                listOf("Good と評価してすべてのキューから外す", "Bad と評価してすべてのキューから外す"),
+                listOf(
+                    "すべてのキューから削除",
+                    "Bad と評価してすべてのキューから削除",
+                    "Good と評価してすべてのキューから削除",
+                ),
                 actions.map { it.label },
             )
-            assertTrue(actions.last().action())
+            assertTrue(actions.first().action())
+            settle(decor)
+            assertEquals(listOf<ArticleRating?>(null), dismissals)
 
             val title = compose.semanticsOwner.unmergedRootSemanticsNode.semanticTree().single { it.text() == article.displayTitle }
             val result = mutableListOf<TextLayoutResult>()
@@ -92,6 +99,7 @@ class ArticleAccessibilityTest {
 
     @Test
     fun articleDetailRatingsCanBeReachedWithTabAndActivatedWithEnter() {
+        RuntimeEnvironment.setFontScale(2f)
         val ratings = mutableListOf<ArticleRating>()
         withScreen({
             ArticlePage(
@@ -104,13 +112,13 @@ class ArticleAccessibilityTest {
             fun focused() = nodes().firstOrNull {
                 it.text().isNotEmpty() && it.config.getOrElse(SemanticsProperties.Focused) { false }
             }?.text()
-            val good = nodes().single { it.text() == "Good と評価" }
+            val good = nodes().single { it.text() == "Good" }
             assertTrue(checkNotNull(good.config[SemanticsActions.RequestFocus].action).invoke())
             settle(decor)
-            assertEquals("Good と評価", focused())
+            assertEquals("Good", focused())
             press(decor, KEYCODE_TAB)
             settle(decor)
-            assertEquals("Bad と評価", focused())
+            assertEquals("Bad", focused())
             press(decor, KEYCODE_ENTER)
             assertEquals(listOf(ArticleRating.Bad), ratings)
         }

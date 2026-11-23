@@ -68,10 +68,10 @@ class FeedFailureNavigationTest {
                 screen.tapContaining(title)
                 screen.text(connectionError)
                 screen.find("保存済みの記事") { "保存済みの記事" in it.text() }
-                screen.text("購読を解除")
+                screen.text("キューを設定")
 
                 offline.set(false)
-                screen.tap("今すぐ更新")
+                screen.tapDescription("今すぐ更新")
                 screen.find("復旧後の記事") { "復旧後の記事" in it.text() }
                 val feeds = store.subscriptions().associateBy { it.id }
                 assertNull(feeds.getValue(feedId).error)

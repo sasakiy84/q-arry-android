@@ -313,6 +313,69 @@ class FeedStoreTest {
     }
 
     @Test
+    fun recordsOriginalOpensAndEachRemovalSourceWithoutRemovingSubscriptions() {
+        store.queueName(null, "Research")
+        store.queueName(null, "Daily")
+        val (research, daily) = store.load(null, false, 1).queues
+        val entries = listOf("single", "open", "queue1", "queue2", "read", "excluded").mapIndexed { index, key ->
+            val title = if (key == "excluded") key else "対象 $key"
+            FeedArticle(key, title, "https://publisher.example/$key", null, 1000L + index)
+        }
+        val feedId = store.subscribe(example.copy(articles = entries), null)
+        val otherFeed = store.subscribe(example.copy(url = "https://other.example/feed"), daily.id)
+        val include = KeywordFilter(KeywordFilterMode.Include, listOf("対象"))
+        store.setMembership(feedId, setOf(research.id, daily.id), mapOf(research.id to include))
+        val ids = store.feedArticles(feedId, 10).articles.associate { it.url!!.substringAfterLast('/') to it.id }
+        store.setRead(ids.getValue("read"), true)
+        store.dismissArticle(ids.getValue("single"), null, research.id)
+        store.dismissArticle(ids.getValue("single"), null, research.id)
+
+        val opened = ids.getValue("open")
+        store.recordOriginalOpen(opened, research.id, openedAt = 5000L)
+        store.recordOriginalOpen(opened, openedAt = 6000L)
+        val viewed = store.history(10).articles.single()
+        assertEquals(6000L, viewed.originalOpenedAt)
+        assertEquals(6000L, viewed.viewedAt)
+        assertTrue(viewed.read && viewed.dismissed)
+        store.dismissArticle(opened, ArticleRating.Good)
+        val rating = store.ratingHistory(10).articles.single()
+        assertEquals(ArticleRating.Good, rating.rating)
+        store.changeRating(rating.key, null)
+        assertTrue(checkNotNull(store.article(opened)).dismissed)
+
+        assertTrue(store.load(research.id, true, 1).hasMore)
+        assertEquals(2, store.dismissQueueArticles(research.id, unreadOnly = true))
+        assertEquals(0, store.dismissQueueArticles(research.id, unreadOnly = true))
+        assertEquals(setOf("対象 read", "excluded"), store.feedArticles(feedId, 10).articles.mapNotNull { it.title }.toSet())
+        store.setFeedKeywordFilter(feedId, include)
+        assertEquals(2, store.dismissFeedArticles(feedId))
+        assertEquals(0, store.dismissFeedArticles(feedId))
+        assertEquals(otherFeed, store.load(daily.id, false, 10).articles.single().feedId)
+        assertEquals(setOf(research.id, daily.id), store.subscriptions().first { it.id == feedId }.queueIds)
+
+        store.removeFeed(feedId)
+        val actions = mutableListOf<Triple<String, String, Long?>>()
+        store.readableDatabase.rawQuery(
+            "SELECT entry_key, kind, queue_id FROM article_action WHERE feed_url = ? ORDER BY id",
+            arrayOf(example.url),
+        ).use { rows ->
+            while (rows.moveToNext()) {
+                actions.add(Triple(rows.getString(0), rows.getString(1), if (rows.isNull(2)) null else rows.getLong(2)))
+            }
+        }
+        val expected = listOf(
+            Triple("single", ArticleAction.RemovedIndividually.name, research.id),
+            Triple("open", ArticleAction.OriginalOpened.name, research.id),
+            Triple("open", ArticleAction.OriginalOpened.name, null),
+            Triple("queue1", ArticleAction.RemovedFromQueueInBulk.name, research.id),
+            Triple("queue2", ArticleAction.RemovedFromQueueInBulk.name, research.id),
+            Triple("read", ArticleAction.RemovedFromFeedInBulk.name, null),
+            Triple("excluded", ArticleAction.RemovedFromFeedInBulk.name, null),
+        )
+        assertEquals(expected.groupingBy { it }.eachCount(), actions.groupingBy { it }.eachCount())
+    }
+
+    @Test
     fun feedFilterMatchesTheOriginalTitleOrDescriptionBeforePagination() {
         val feedId = store.subscribe(example.copy(articles = listOf(
             FeedArticle("latest", "キーワードなし", null, "別の記事", 4000),
@@ -362,7 +425,11 @@ class FeedStoreTest {
         assertFalse(store.load(queueId, false, 1).hasUnread)
         assertEquals(listOf("その他", "First article"), store.load(null, true, 10).articles.map { it.title })
         assertEquals(0, store.markAllRead(queueId))
-        assertEquals(2, store.markAllRead(null))
+        assertEquals(listOf("First article"), store.load(null, true, 1, unassignedOnly = true).articles.map { it.title })
+        assertEquals(1, store.markAllRead(null, unassignedOnly = true))
+        assertFalse(store.load(null, false, 1, unassignedOnly = true).hasUnread)
+        assertEquals(listOf("その他"), store.load(null, true, 10).articles.map { it.title })
+        assertEquals(1, store.markAllRead(null))
         assertTrue(store.load(null, true, 10).articles.isEmpty())
         assertFalse(checkNotNull(store.article(dismissed.id)).read)
         assertTrue(store.history(10).articles.isEmpty())
@@ -559,19 +626,21 @@ class FeedStoreTest {
         assertEquals(1_000L, store.article(articleId)?.discoveredAt)
         assertNull(store.article(articleId)?.changeDetectedAt)
 
-        val changed = initial.copy(observedAt = 3_000L, articles = initial.articles.map { it.copy(body = "更新") })
+        val changeTime = 120_000L
+        val changed = initial.copy(observedAt = changeTime, articles = initial.articles.map { it.copy(body = "更新") })
         store.recordRefresh(feedId, changed)
-        store.recordRefresh(feedId, changed.copy(observedAt = 4_000L))
+        store.recordRefresh(feedId, changed.copy(observedAt = 180_000L))
         val article = checkNotNull(store.article(articleId))
-        assertEquals(3_000L, article.changeDetectedAt)
+        assertEquals(changeTime, article.changeDetectedAt)
         assertEquals(1_000L, article.discoveredAt)
-        assertTrue(article.timestampLabel(null)?.startsWith("更新検知 ") == true)
+        assertEquals(articleTimestampLabel(changeTime, null, discoveredAt = null), article.timestampLabel(null))
 
-        val dated = changed.copy(articles = changed.articles.map { it.copy(updatedAt = 2_500L) })
+        val sourceUpdateTime = 60_000L
+        val dated = changed.copy(articles = changed.articles.map { it.copy(updatedAt = sourceUpdateTime) })
         store.recordRefresh(feedId, dated)
         val updated = checkNotNull(store.article(articleId))
-        assertEquals(2_500L, updated.updatedAt)
-        assertTrue(updated.timestampLabel(null)?.startsWith("更新 ") == true)
+        assertEquals(sourceUpdateTime, updated.updatedAt)
+        assertEquals(articleTimestampLabel(sourceUpdateTime, null, discoveredAt = null), updated.timestampLabel(null))
     }
 
     @Test
@@ -589,11 +658,38 @@ class FeedStoreTest {
         assertEquals(5_000L, store.feedArticles(id, 10).articles.single().discoveredAt)
     }
 
+    @Test
+    fun upgradingVersionEightKeepsExistingRatingsVisitsAndCacheValidators() {
+        val feed = store.subscribe(example.copy(etag = "\"current\""), null)
+        val article = store.feedArticles(feed, 10).articles.single()
+        store.recordView(article.id, 2500L)
+        store.dismissArticle(article.id, ArticleRating.Bad)
+        reopenFromVersion(8)
+        assertEquals("\"current\"", store.subscriptions().single().etag)
+        assertEquals(ArticleRating.Bad, store.ratingHistory(10).articles.single().rating)
+        val history = store.history(10).articles.single()
+        assertEquals(2500L, history.viewedAt)
+        assertNull(history.originalOpenedAt)
+        store.readableDatabase.rawQuery("SELECT 1 FROM article_action", null).use { assertFalse(it.moveToFirst()) }
+    }
+
     private fun reopenFromVersion(version: Int, removeNewerSchema: SQLiteDatabase.() -> Unit = {}) {
         store.writableDatabase.apply {
-            execSQL("ALTER TABLE article DROP COLUMN source_updated_at")
-            execSQL("ALTER TABLE article DROP COLUMN source_published_at")
-            execSQL("ALTER TABLE article DROP COLUMN change_detected_at")
+            execSQL("DROP TRIGGER article_search_update")
+            execSQL("DROP TRIGGER article_search_delete")
+            execSQL("DROP TABLE article_vector")
+            execSQL("DROP TABLE article_fts")
+            execSQL("DROP TABLE article_archive")
+            execSQL("DROP TABLE search_options")
+            if (version < 9) {
+                execSQL("DROP TABLE article_action")
+                execSQL("ALTER TABLE article DROP COLUMN original_opened_at")
+            }
+            if (version < 8) {
+                execSQL("ALTER TABLE article DROP COLUMN source_updated_at")
+                execSQL("ALTER TABLE article DROP COLUMN source_published_at")
+                execSQL("ALTER TABLE article DROP COLUMN change_detected_at")
+            }
             if (version < 7) execSQL("ALTER TABLE feed DROP COLUMN html_watch")
             removeNewerSchema()
             this.version = version

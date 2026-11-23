@@ -40,6 +40,7 @@ android {
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+            proguardFiles("proguard-rules.pro")
         }
     }
 
@@ -88,6 +89,7 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation("org.jsoup:jsoup:1.23.2")
     implementation("io.coil-kt:coil-compose:2.7.0")
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.23.2")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.robolectric:robolectric:4.17")
     robolectricSdk("org.robolectric:android-all-instrumented:16-robolectric-13921718-i7")

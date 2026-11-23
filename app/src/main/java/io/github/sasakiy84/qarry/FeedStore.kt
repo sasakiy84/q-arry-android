@@ -5,6 +5,8 @@ import android.content.Context
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import android.database.sqlite.SQLiteException
+import java.util.PriorityQueue
 
 data class Subscription(
     val id: Long,
@@ -46,6 +48,8 @@ data class Article(
     val publishedTime: Long? = published,
     val changeDetectedAt: Long? = null,
     val discoveredAt: Long? = null,
+    val originalOpenedAt: Long? = null,
+    val archivedBody: String? = null,
 ) {
     val displayTitle: String get() = title ?: url ?: "無題の記事"
 }
@@ -55,6 +59,10 @@ data class FeedQueue(val id: Long, val name: String, val feedCount: Int)
 data class ArticleListing(val articles: List<Article>, val hasMore: Boolean)
 
 internal data class RatingKey(val feedUrl: String, val entryKey: String)
+
+internal enum class ArticleAction {
+    OriginalOpened, RemovedIndividually, RemovedFromQueueInBulk, RemovedFromFeedInBulk,
+}
 
 internal data class RatedArticle(
     val key: RatingKey,
@@ -77,7 +85,7 @@ data class LibrarySnapshot(
     val hasUnread: Boolean = articles.any { !it.read },
 )
 
-class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null, 8) {
+class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null, 10) {
     override fun onConfigure(db: SQLiteDatabase): Unit = db.setForeignKeyConstraintsEnabled(true)
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -116,6 +124,7 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
                 source_updated_at INTEGER,
                 source_published_at INTEGER,
                 change_detected_at INTEGER,
+                original_opened_at INTEGER,
                 UNIQUE(feed_id, entry_key)
             )
             """.trimIndent(),
@@ -134,11 +143,13 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
         )
         db.execSQL("CREATE INDEX feed_queue_by_queue ON feed_queue(queue_id, feed_id)")
         createArticleFeedback(db)
+        createArticleActions(db)
         createKeywordFilters(db)
+        createArticleSearch(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        check(oldVersion in 1..7 && newVersion == 8) { "No database migration from $oldVersion to $newVersion" }
+        check(oldVersion in 1..9 && newVersion == 10) { "No database migration from $oldVersion to $newVersion" }
         if (oldVersion == 1) {
             db.execSQL("ALTER TABLE feed ADD COLUMN html_item_selector TEXT")
             db.execSQL("ALTER TABLE article ADD COLUMN thumbnail_url TEXT")
@@ -153,11 +164,67 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
         if (oldVersion < 5) db.execSQL(FEED_ARTICLE_INDEX)
         if (oldVersion < 6) createKeywordFilters(db)
         if (oldVersion < 7) db.execSQL("ALTER TABLE feed ADD COLUMN html_watch TEXT")
-        db.execSQL("ALTER TABLE article ADD COLUMN source_updated_at INTEGER")
-        db.execSQL("ALTER TABLE article ADD COLUMN source_published_at INTEGER")
-        db.execSQL("ALTER TABLE article ADD COLUMN change_detected_at INTEGER")
-        // Re-read feed entries once to recover source times that older versions did not store.
-        db.execSQL("UPDATE feed SET etag = NULL, modified = NULL")
+        if (oldVersion < 8) {
+            db.execSQL("ALTER TABLE article ADD COLUMN source_updated_at INTEGER")
+            db.execSQL("ALTER TABLE article ADD COLUMN source_published_at INTEGER")
+            db.execSQL("ALTER TABLE article ADD COLUMN change_detected_at INTEGER")
+            // Re-read feed entries once to recover source times that older versions did not store.
+            db.execSQL("UPDATE feed SET etag = NULL, modified = NULL")
+        }
+        if (oldVersion < 9) {
+            db.execSQL("ALTER TABLE article ADD COLUMN original_opened_at INTEGER")
+            createArticleActions(db)
+        }
+        createArticleSearch(db)
+    }
+
+    private fun createArticleSearch(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE article_archive (
+                article_id INTEGER PRIMARY KEY REFERENCES article(id) ON DELETE CASCADE,
+                body TEXT,
+                retry_at INTEGER NOT NULL
+            )
+            """.trimIndent(),
+        )
+        db.execSQL("CREATE VIRTUAL TABLE article_fts USING fts4(title, body, tokenize=simple)")
+        db.execSQL("CREATE TABLE article_vector (article_id INTEGER PRIMARY KEY REFERENCES article(id) ON DELETE CASCADE, embedding BLOB NOT NULL)")
+        db.execSQL("CREATE TABLE search_options (id INTEGER PRIMARY KEY CHECK(id = 1), semantic_enabled INTEGER NOT NULL)")
+        db.execSQL(
+            """
+            CREATE TRIGGER article_search_update AFTER UPDATE OF title, body, url ON article
+            WHEN NEW.title IS NOT OLD.title OR NEW.body IS NOT OLD.body OR NEW.url IS NOT OLD.url
+            BEGIN
+                DELETE FROM article_fts WHERE docid = NEW.id;
+                DELETE FROM article_vector WHERE article_id = NEW.id;
+                DELETE FROM article_archive WHERE article_id = NEW.id AND NEW.url IS NOT OLD.url;
+            END
+            """.trimIndent(),
+        )
+        db.execSQL(
+            """
+            CREATE TRIGGER article_search_delete AFTER DELETE ON article BEGIN
+                DELETE FROM article_fts WHERE docid = OLD.id;
+            END
+            """.trimIndent(),
+        )
+    }
+
+    private fun createArticleActions(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE article_action (
+                id INTEGER PRIMARY KEY,
+                feed_url TEXT NOT NULL,
+                entry_key TEXT NOT NULL,
+                article_url TEXT,
+                kind TEXT NOT NULL,
+                queue_id INTEGER,
+                occurred_at INTEGER NOT NULL
+            )
+            """.trimIndent(),
+        )
     }
 
     private fun createKeywordFilters(db: SQLiteDatabase) {
@@ -196,7 +263,7 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
         )
     }
 
-    fun load(queueId: Long?, unreadOnly: Boolean, limit: Int): LibrarySnapshot =
+    fun load(queueId: Long?, unreadOnly: Boolean, limit: Int, unassignedOnly: Boolean = false): LibrarySnapshot =
         readableDatabase.transaction {
             val queues = rawQuery(
                 """
@@ -206,10 +273,11 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
                 """.trimIndent(),
                 null,
             ).use { cursor -> cursor.rows { FeedQueue(getLong(0), getString(1), getInt(2)) } }
-            val listing = articleListing(articleListCondition(queueId != null, unreadOnly), articleListArgs(queueId), limit)
+            val args = articleListArgs(queueId)
+            val listing = articleListing(articleListCondition(queueId, unreadOnly, unassignedOnly), args, limit)
             val hasUnread = listing.articles.any { !it.read } || (!unreadOnly && listing.hasMore && rawQuery(
-                "SELECT 1 $ARTICLE_FROM WHERE ${articleListCondition(queueId != null, unreadOnly = true)} LIMIT 1",
-                articleListArgs(queueId).toTypedArray(),
+                "SELECT 1 $ARTICLE_FROM WHERE ${articleListCondition(queueId, true, unassignedOnly)} LIMIT 1",
+                args.toTypedArray(),
             ).use { it.moveToFirst() })
             LibrarySnapshot(subscriptions(this), queues, listing.articles, listing.hasMore, hasUnread)
         }
@@ -248,9 +316,148 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
     }
 
     fun article(id: Long): Article? = readableDatabase.rawQuery(
-        "${articleQuery("a.body")} WHERE a.id = ?",
+        "${articleQuery("a.body", "(SELECT body FROM article_archive WHERE article_id = a.id)")} WHERE a.id = ?",
         arrayOf(id.toString()),
     ).use { cursor -> if (cursor.moveToFirst()) cursor.readArticle() else null }
+
+    internal fun archiveCandidates(now: Long, limit: Int): List<ArchiveCandidate> = readableDatabase.rawQuery(
+        """
+        SELECT a.id, a.url FROM article a LEFT JOIN article_archive t ON t.article_id = a.id
+        WHERE a.url LIKE 'https://%' AND (t.article_id IS NULL OR t.retry_at <= ?)
+        ORDER BY COALESCE(t.retry_at, 0), a.id DESC LIMIT ?
+        """.trimIndent(),
+        arrayOf(now.toString(), limit.toString()),
+    ).use { it.rows { ArchiveCandidate(getLong(0), getString(1)) } }
+
+    internal fun saveArchive(candidate: ArchiveCandidate, body: String?, retryAt: Long): Boolean = writableDatabase.transaction {
+        val args = arrayOf(candidate.id.toString(), candidate.url)
+        val current = rawQuery(
+            "SELECT t.body, SUBSTR(a.body, 1, $MAX_ARCHIVE_CHARS) FROM article a LEFT JOIN article_archive t ON t.article_id = a.id WHERE a.id = ? AND a.url = ?",
+            args,
+        ).use { if (it.moveToFirst()) it.getString(0) to it.getString(1) else null } ?: return@transaction false
+        val candidateBody = body?.takeIf { it.length >= current.second.length * 0.8 }
+        val next = candidateBody ?: current.first
+        execSQL(
+            """
+            INSERT INTO article_archive(article_id, body, retry_at) VALUES (?, ?, ?)
+            ON CONFLICT(article_id) DO UPDATE SET body = excluded.body, retry_at = excluded.retry_at
+            """.trimIndent(),
+            arrayOf<Any?>(candidate.id, next, retryAt),
+        )
+        if (next != current.first) {
+            execSQL("DELETE FROM article_fts WHERE docid = ?", arrayOf(candidate.id))
+            execSQL("DELETE FROM article_vector WHERE article_id = ?", arrayOf(candidate.id))
+        }
+        candidateBody != null
+    }
+
+    internal fun indexArticles(limit: Int): Int = writableDatabase.transaction {
+        val documents = rawQuery(
+            """
+            SELECT a.id, a.title, SUBSTR(COALESCE(t.body, a.body), 1, $MAX_ARCHIVE_CHARS)
+            FROM article a LEFT JOIN article_archive t ON t.article_id = a.id
+            LEFT JOIN article_fts x ON x.docid = a.id WHERE x.docid IS NULL ORDER BY a.id DESC LIMIT ?
+            """.trimIndent(),
+            arrayOf(limit.toString()),
+        ).use { it.rows { SearchDocument(getLong(0), getString(1), getString(2)) } }
+        val insert = compileStatement("INSERT INTO article_fts(docid, title, body) VALUES (?, ?, ?)")
+        insert.use {
+            for (document in documents) {
+                if (Thread.currentThread().isInterrupted) throw InterruptedException()
+                it.bindLong(1, document.id)
+                it.bindString(2, japaneseIndexTokens(document.title))
+                it.bindString(3, japaneseIndexTokens(document.storedBody))
+                it.executeInsert()
+            }
+        }
+        documents.size
+    }
+
+    internal fun lexicalArticleIds(words: List<String>, limit: Int): List<Long> = readableDatabase.rawQuery(
+        """
+        SELECT a.id FROM article_fts JOIN article a ON a.id = article_fts.docid
+        WHERE article_fts MATCH ?
+        ORDER BY (instr(lower(a.title), ?) > 0) DESC, COALESCE(a.published, a.discovered) DESC, a.id DESC LIMIT ?
+        """.trimIndent(),
+        arrayOf(japaneseMatchQuery(words), words.first(), limit.toString()),
+    ).use { it.rows { getLong(0) } }
+
+    internal fun searchArticles(ids: List<Long>, term: String): List<Article> {
+        val fullBody = "COALESCE((SELECT body FROM article_archive WHERE article_id = a.id), a.body)"
+        val preview = "SUBSTR($fullBody, MAX(1, instr(lower($fullBody), ?) - 32), 240)"
+        return ids.chunked(200).flatMap { batch ->
+            val placeholders = batch.joinToString(",") { "?" }
+            val articles = readableDatabase.rawQuery(
+                "${articleQuery(preview)} WHERE a.id IN ($placeholders)", (listOf(term) + batch.map(Long::toString)).toTypedArray(),
+            ).use { cursor -> cursor.rows { readArticle() }.associateBy { it.id } }
+            batch.mapNotNull(articles::get)
+        }
+    }
+
+    internal fun documentsForVectors(limit: Int): List<SearchDocument> = readableDatabase.rawQuery(
+        """
+        SELECT a.id, a.title, SUBSTR(COALESCE(t.body, a.body), 1, 4000)
+        FROM article a LEFT JOIN article_archive t ON t.article_id = a.id
+        LEFT JOIN article_vector v ON v.article_id = a.id WHERE v.article_id IS NULL
+        ORDER BY a.id DESC LIMIT ?
+        """.trimIndent(),
+        arrayOf(limit.toString()),
+    ).use { it.rows { SearchDocument(getLong(0), getString(1), getString(2)) } }
+
+    internal fun saveVector(document: SearchDocument, vector: FloatArray) = writableDatabase.execSQL(
+        """
+        INSERT OR IGNORE INTO article_vector(article_id, embedding)
+        SELECT a.id, ? FROM article a LEFT JOIN article_archive t ON t.article_id = a.id
+        WHERE a.id = ? AND a.title = ? AND SUBSTR(COALESCE(t.body, a.body), 1, 4000) = ?
+        """.trimIndent(),
+        arrayOf<Any>(encodeEmbedding(vector), document.id, document.title, document.storedBody),
+    )
+
+    internal fun semanticArticleIds(vector: FloatArray, limit: Int): List<Long> {
+        val nearest = PriorityQueue<Pair<Long, Float>>(compareBy({ it.second }, { it.first }))
+        readableDatabase.rawQuery("SELECT article_id, embedding FROM article_vector", null).use { cursor ->
+            while (cursor.moveToNext()) {
+                if (Thread.currentThread().isInterrupted) throw InterruptedException()
+                val similarity = embeddingSimilarity(vector, cursor.getBlob(1))
+                if (similarity >= 0.40f && (nearest.size < limit || similarity > (nearest.peek()?.second ?: -1f))) {
+                    if (nearest.size == limit) nearest.poll()
+                    nearest.add(cursor.getLong(0) to similarity)
+                }
+            }
+        }
+        return nearest.sortedWith(compareByDescending<Pair<Long, Float>> { it.second }.thenByDescending { it.first }).map { it.first }
+    }
+
+    internal fun semanticEnabled(): Boolean = readableDatabase.rawQuery(
+        "SELECT semantic_enabled FROM search_options WHERE id = 1", null,
+    ).use { it.moveToFirst() && it.getInt(0) != 0 }
+
+    internal fun setSemanticEnabled(enabled: Boolean) {
+        writableDatabase.execSQL("INSERT OR REPLACE INTO search_options(id, semantic_enabled) VALUES (1, ?)", arrayOf(if (enabled) 1 else 0))
+    }
+
+    internal fun searchStats(modelBytes: Long): SearchStats = readableDatabase.transaction {
+        fun count(query: String): Long = rawQuery(query, null).use {
+            it.moveToFirst()
+            it.getLong(0)
+        }
+        fun pageBytes(filter: String): Long? = try {
+            count("SELECT COALESCE(SUM(pgsize), 0) FROM dbstat WHERE $filter")
+        } catch (_: SQLiteException) {
+            null
+        }
+        SearchStats(
+            articles = count("SELECT COUNT(*) FROM article"),
+            archived = count("SELECT COUNT(body) FROM article_archive"),
+            indexed = count("SELECT COUNT(*) FROM article_fts"),
+            archiveBytes = count("SELECT COALESCE(SUM(length(CAST(body AS BLOB))), 0) FROM article_archive"),
+            lexicalBytes = pageBytes("name GLOB 'article_fts_*'"),
+            vectors = count("SELECT COUNT(*) FROM article_vector"),
+            vectorBytes = pageBytes("name = 'article_vector'"),
+            modelBytes = modelBytes,
+            semanticEnabled = semanticEnabled(),
+        )
+    }
 
     private fun SQLiteDatabase.articleListing(
         where: String,
@@ -457,29 +664,87 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
     fun setRead(id: Long, read: Boolean): Unit =
         writableDatabase.execSQL("UPDATE article SET read = ? WHERE id = ?", arrayOf(if (read) 1 else 0, id))
 
-    fun markAllRead(queueId: Long?): Int = writableDatabase.update(
+    fun markAllRead(queueId: Long?, unassignedOnly: Boolean = false): Int = writableDatabase.update(
         "article",
         ContentValues(1).apply { put("read", 1) },
-        "id IN (SELECT a.id $ARTICLE_FROM WHERE ${articleListCondition(queueId != null, unreadOnly = true)})",
+        "id IN (SELECT a.id $ARTICLE_FROM WHERE ${articleListCondition(queueId, true, unassignedOnly)})",
         articleListArgs(queueId).toTypedArray(),
     )
 
     fun recordView(id: Long, viewedAt: Long = System.currentTimeMillis()): Unit =
         writableDatabase.execSQL("UPDATE article SET read = 1, viewed_at = ? WHERE id = ?", arrayOf(viewedAt, id))
 
-    fun dismissArticle(id: Long, rating: ArticleRating?): Unit = writableDatabase.transaction {
-        val dismissed = ContentValues().apply { put("dismissed", 1) }
-        if (update("article", dismissed, "id = ? AND dismissed = 0", arrayOf(id.toString())) == 0) return@transaction
-        if (rating != null) {
+    fun recordOriginalOpen(id: Long, queueId: Long? = null, openedAt: Long = System.currentTimeMillis()): Unit =
+        writableDatabase.transaction {
+            insertArticleActions(ArticleAction.OriginalOpened, queueId, "a.id = ?", listOf(id.toString()), openedAt)
             execSQL(
                 """
-                INSERT OR IGNORE INTO article_feedback(feed_url, entry_key, article_url, title, body, published_at, rating, rated_at)
-                SELECT f.url, a.entry_key, a.url, a.title, a.body, a.published, ?, ?
-                FROM article a JOIN feed f ON f.id = a.feed_id WHERE a.id = ?
+                UPDATE article SET read = 1, dismissed = 1,
+                    viewed_at = MAX(COALESCE(viewed_at, ?), ?),
+                    original_opened_at = MAX(COALESCE(original_opened_at, ?), ?)
+                WHERE id = ?
                 """.trimIndent(),
-                arrayOf<Any>(rating.value, System.currentTimeMillis(), id),
+                arrayOf(openedAt, openedAt, openedAt, openedAt, id),
             )
         }
+
+    internal fun recordArchivedOriginalOpen(key: RatingKey, url: String): Unit = writableDatabase.execSQL(
+        "INSERT INTO article_action(feed_url, entry_key, article_url, kind, occurred_at) VALUES (?, ?, ?, ?, ?)",
+        arrayOf<Any>(key.feedUrl, key.entryKey, url, ArticleAction.OriginalOpened.name, System.currentTimeMillis()),
+    )
+
+    fun dismissArticle(id: Long, rating: ArticleRating?, queueId: Long? = null): Unit = writableDatabase.transaction {
+        if (rating == null) {
+            dismissArticles(ArticleAction.RemovedIndividually, queueId, "$ACTIVE_ARTICLE AND a.id = ?", listOf(id.toString()))
+            return@transaction
+        }
+        val dismissed = ContentValues().apply { put("dismissed", 1) }
+        val updated = update(
+            "article", dismissed, "id = ? AND (dismissed = 0 OR original_opened_at IS NOT NULL)", arrayOf(id.toString()),
+        )
+        if (updated == 0) return@transaction
+        execSQL(
+            """
+            INSERT OR IGNORE INTO article_feedback(feed_url, entry_key, article_url, title, body, published_at, rating, rated_at)
+            SELECT f.url, a.entry_key, a.url, a.title, a.body, a.published, ?, ?
+            FROM article a JOIN feed f ON f.id = a.feed_id WHERE a.id = ?
+            """.trimIndent(),
+            arrayOf<Any>(rating.value, System.currentTimeMillis(), id),
+        )
+    }
+
+    fun dismissQueueArticles(queueId: Long, unreadOnly: Boolean): Int = writableDatabase.transaction {
+        dismissArticles(
+            ArticleAction.RemovedFromQueueInBulk, queueId,
+            articleListCondition(queueId, unreadOnly, unassignedOnly = false), articleListArgs(queueId),
+        )
+    }
+
+    fun dismissFeedArticles(feedId: Long): Int = writableDatabase.transaction {
+        dismissArticles(ArticleAction.RemovedFromFeedInBulk, null, "$ACTIVE_ARTICLE AND a.feed_id = ?", listOf(feedId.toString()))
+    }
+
+    private fun SQLiteDatabase.dismissArticles(
+        action: ArticleAction, queueId: Long?, condition: String, args: List<String>,
+    ): Int {
+        insertArticleActions(action, queueId, condition, args, System.currentTimeMillis())
+        return update(
+            "article", ContentValues().apply { put("dismissed", 1) },
+            "id IN (SELECT a.id $ARTICLE_FROM WHERE $condition)", args.toTypedArray(),
+        )
+    }
+
+    private fun SQLiteDatabase.insertArticleActions(
+        action: ArticleAction, queueId: Long?, condition: String, args: List<String>, occurredAt: Long,
+    ) {
+        execSQL(
+            """
+            INSERT INTO article_action(feed_url, entry_key, article_url, kind, queue_id, occurred_at)
+            SELECT f.url, a.entry_key, a.url, ?, ?, ?
+            $ARTICLE_FROM WHERE $condition
+            """.trimIndent(),
+            arrayOf<Any?>(action.name, queueId, occurredAt, *args.toTypedArray()),
+        )
     }
 
     internal fun changeRating(key: RatingKey, rating: ArticleRating?): Unit = writableDatabase.transaction {
@@ -489,7 +754,10 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
             update("article_feedback", values, "feed_url = ? AND entry_key = ?", args)
         } else if (delete("article_feedback", "feed_url = ? AND entry_key = ?", args) > 0) {
             execSQL(
-                "UPDATE article SET dismissed = 0 WHERE feed_id = (SELECT id FROM feed WHERE url = ?) AND entry_key = ?",
+                """
+                UPDATE article SET dismissed = 0
+                WHERE feed_id = (SELECT id FROM feed WHERE url = ?) AND entry_key = ? AND original_opened_at IS NULL
+                """.trimIndent(),
                 args,
             )
         }
@@ -548,6 +816,8 @@ private fun Cursor.readArticle(): Article =
         rating = ArticleRating.entries.firstOrNull { it.value == getInt(11) },
         updatedAt = nullableLong(12), publishedTime = nullableLong(13),
         changeDetectedAt = nullableLong(14), discoveredAt = getLong(15),
+        originalOpenedAt = nullableLong(16),
+        archivedBody = getString(17),
     )
 
 private const val ACTIVE_ARTICLE = "a.dismissed = 0 AND r.rating IS NULL"
@@ -556,10 +826,14 @@ private const val FEED_ARTICLE_INDEX =
 
 private data class KeywordTerm(val feedId: Long, val queueId: Long?, val mode: KeywordFilterMode, val term: String)
 
-private fun articleListCondition(forQueue: Boolean, unreadOnly: Boolean): String = buildList {
+private fun articleListCondition(queueId: Long?, unreadOnly: Boolean, unassignedOnly: Boolean): String = buildList {
     add(ACTIVE_ARTICLE)
-    if (forQueue) add("EXISTS (SELECT 1 FROM feed_queue fq WHERE fq.feed_id = a.feed_id AND fq.queue_id = ?)")
-    add(keywordFilterCondition(forQueue))
+    if (queueId != null) {
+        add("EXISTS (SELECT 1 FROM feed_queue fq WHERE fq.feed_id = a.feed_id AND fq.queue_id = ?)")
+    } else if (unassignedOnly) {
+        add("NOT EXISTS (SELECT 1 FROM feed_queue fq WHERE fq.feed_id = a.feed_id)")
+    }
+    add(keywordFilterCondition(forQueue = queueId != null))
     if (unreadOnly) add("a.read = 0")
 }.joinToString(" AND ")
 
@@ -585,10 +859,10 @@ private const val ARTICLE_FROM = """
     LEFT JOIN article_feedback r ON r.feed_url = f.url AND r.entry_key = a.entry_key
 """
 
-private fun articleQuery(body: String): String = """
+private fun articleQuery(body: String, archivedBody: String = "NULL"): String = """
     SELECT a.id, f.title, NULLIF(a.title, ''), a.url, NULLIF($body, ''), a.published, a.read,
            a.thumbnail_url, a.feed_id, a.viewed_at, a.dismissed OR r.rating IS NOT NULL, r.rating,
-           a.source_updated_at, a.source_published_at, a.change_detected_at, a.discovered
+           a.source_updated_at, a.source_published_at, a.change_detected_at, a.discovered, a.original_opened_at, $archivedBody
     $ARTICLE_FROM
 """.trimIndent()
 

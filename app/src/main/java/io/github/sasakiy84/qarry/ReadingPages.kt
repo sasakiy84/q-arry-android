@@ -3,6 +3,7 @@ package io.github.sasakiy84.qarry
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
@@ -47,6 +48,8 @@ internal fun SettingsPage(
     choosingFile: Boolean,
     onImport: () -> Unit,
     onExport: () -> Unit,
+    archive: ArticleArchive,
+    libraryRevision: Int,
     viewed: ArticleListing?,
     rated: RatingListing?,
     onArticle: (Article, ArticlePress) -> Unit,
@@ -68,6 +71,8 @@ internal fun SettingsPage(
                 ArticleOpeningSettings(articleOpenMode, onArticleOpenMode)
                 HorizontalDivider(Modifier.padding(horizontal = 20.dp))
                 FeedTransferSettings(transfer, choosingFile, onImport, onExport)
+                HorizontalDivider(Modifier.padding(horizontal = 20.dp))
+                ArticleSearchSettings(archive, libraryRevision)
             }
             SettingsTab.Viewed -> when {
                 viewed == null -> LoadingIndicator("閲覧履歴を読み込み中")
@@ -188,11 +193,13 @@ internal fun FeedDetailPage(
     onRefresh: () -> Unit,
     onChangeWebsiteScope: () -> Unit,
     onUnsubscribe: () -> Unit,
+    onDismissFeedArticles: () -> Unit,
     onArticle: (Article, ArticlePress) -> Unit,
     onDismiss: suspend (Article, ArticleRating?) -> Boolean,
     modifier: Modifier = Modifier,
 ) {
     var unfiltered by rememberSaveable(feed.keywordFilter) { mutableStateOf(false) }
+    var showActions by rememberSaveable(feed.id) { mutableStateOf(false) }
     var limit by rememberSaveable(feed.keywordFilter) { mutableIntStateOf(75) }
     var articles by remember { mutableStateOf<ArticleListing?>(null) }
     var loadedFilter by remember { mutableStateOf<Pair<KeywordFilter?, Boolean>?>(null) }
@@ -227,14 +234,15 @@ internal fun FeedDetailPage(
     val listState = key(feed.keywordFilter, showingUnfiltered) { rememberLazyListState() }
     LazyColumn(modifier, state = listState, contentPadding = PaddingValues(bottom = 24.dp)) {
         item {
-            Column(
-                Modifier.padding(horizontal = 20.dp, vertical = 16.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row(
+                    Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, top = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
                     Text(
-                        feed.title, Modifier.weight(1f).semantics { heading() },
-                        style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold,
+                        feed.title, Modifier.weight(1f).padding(end = 4.dp).semantics { heading() },
+                        style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold,
+                        maxLines = 2, overflow = TextOverflow.Ellipsis,
                     )
                     IconToggleButton(checked = feed.isFavorite, onCheckedChange = onFavoriteChange) {
                         Icon(
@@ -243,55 +251,64 @@ internal fun FeedDetailPage(
                             tint = if (feed.isFavorite) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
+                    IconButton(onClick = { showActions = true }) {
+                        Icon(painterResource(R.drawable.ic_more), "フィードのその他の操作")
+                    }
                 }
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FlowRow(
+                    Modifier.padding(horizontal = 16.dp),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    itemVerticalAlignment = Alignment.CenterVertically,
+                ) {
                     site?.let { address ->
                         OutlinedButton(onClick = { onLink(address) }, contentPadding = PaddingValues(horizontal = 14.dp)) {
-                            Text(
-                                when {
-                                    webPage -> "登録ページを開く"
-                                    home != null -> "トップページを開く"
-                                    else -> "配信元サイトを開く"
-                                },
-                            )
+                            Text(if (webPage) "監視ページ" else "サイト")
                         }
                     }
-                    if (site != feed.url) {
-                        OutlinedButton(onClick = { onLink(feed.url) }, contentPadding = PaddingValues(horizontal = 14.dp)) {
-                            Text("フィードURLを開く")
-                        }
+                    TextButton(onManage) { Text("キューを設定") }
+                    IconButton(onClick = onRefresh, enabled = !refreshing) {
+                        Icon(painterResource(R.drawable.ic_refresh), "今すぐ更新")
                     }
                 }
                 if (queues.isNotEmpty()) {
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        queues.forEach { queue -> AssistChip(onClick = { onQueue(queue.id) }, label = { Text(queue.name) }) }
+                    LazyRow(
+                        contentPadding = PaddingValues(horizontal = 16.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        items(queues, key = { it.id }) { queue ->
+                            AssistChip(
+                                onClick = { onQueue(queue.id) },
+                                label = { Text(queue.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                                modifier = Modifier.widthIn(max = 220.dp),
+                            )
+                        }
                     }
                 }
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    TextButton(onManage) { Text("キューを設定") }
-                    TextButton(onKeywordFilter) {
-                        Text(feed.keywordFilter?.let { "フィルター（${it.summary}）" } ?: "フィルターを設定")
+                feed.error?.let { error ->
+                    Surface(
+                        Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                        shape = MaterialTheme.shapes.small, color = MaterialTheme.colorScheme.errorContainer,
+                        contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                    ) {
+                        Text(
+                            error, Modifier.padding(horizontal = 12.dp, vertical = 8.dp).announceStatus(),
+                            style = MaterialTheme.typography.bodySmall,
+                        )
                     }
-                    TextButton(onRefresh, enabled = !refreshing) { Text("今すぐ更新") }
-                    if (webPage && feed.error != WEBSITE_SCOPE_CHANGED) {
-                        TextButton(onChangeWebsiteScope) { Text("監視範囲を変更") }
-                    }
-                    TextButton(onUnsubscribe) { Text("購読を解除") }
-                }
-                feed.error?.let {
-                    Text(it, Modifier.announceStatus(), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
                 }
                 if (webPage && feed.error == WEBSITE_SCOPE_CHANGED) {
-                    OutlinedButton(onChangeWebsiteScope) { Text("範囲を選び直す") }
+                    OutlinedButton(onChangeWebsiteScope, Modifier.padding(horizontal = 16.dp)) { Text("範囲を選び直す") }
                 }
+                Spacer(Modifier.height(4.dp))
             }
             HorizontalDivider()
             FlowRow(
-                Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp),
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 itemVerticalAlignment = Alignment.CenterVertically,
             ) {
                 Text("記事一覧", Modifier.semantics { heading() }, style = MaterialTheme.typography.titleMedium)
+                TextButton(onDismissFeedArticles, enabled = listing.articles.isNotEmpty() || feed.keywordFilter != null) { Text("一括削除") }
                 if (feed.keywordFilter != null) {
                     FilterChip(showingUnfiltered, { unfiltered = !unfiltered; limit = 75 }, label = { Text("絞り込み前を表示") })
                 }
@@ -305,7 +322,34 @@ internal fun FeedDetailPage(
                 EmptyState(message, null, scrollable = false)
             }
         }
-        articleCards(listing.articles, onArticle, onDismiss)
+        articleCards(listing.articles, onArticle, onDismiss, showFeedTitle = false)
         if (listing.hasMore) moreArticles { limit += 75 }
+    }
+    if (showActions) {
+        val actions = buildList {
+            if (site != feed.url) add("フィードURLを開く" to { onLink(feed.url) })
+            add((if (feed.keywordFilter != null) "フィルターを編集" else "フィルターを設定") to onKeywordFilter)
+            if (webPage && feed.error != WEBSITE_SCOPE_CHANGED) add("監視範囲を変更" to onChangeWebsiteScope)
+            add("購読を解除" to onUnsubscribe)
+        }
+        AlertDialog(
+            onDismissRequest = { showActions = false },
+            title = { Text("フィードの操作") },
+            text = {
+                Column(Modifier.verticalScroll(rememberScrollState())) {
+                    actions.forEach { (label, action) ->
+                        TextButton(
+                            onClick = {
+                                showActions = false
+                                action()
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
+                        ) { Text(label, Modifier.fillMaxWidth()) }
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { showActions = false }) { Text("閉じる") } },
+        )
     }
 }

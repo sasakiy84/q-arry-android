@@ -32,6 +32,7 @@ import java.time.format.DateTimeFormatter
 import java.util.Locale
 
 internal val pagePadding = PaddingValues(start = 20.dp, end = 20.dp, top = 16.dp, bottom = 28.dp)
+private const val UNASSIGNED_FILTER_LABEL = "キュー未設定のみ"
 
 @Composable
 internal fun ArticlesPage(
@@ -39,7 +40,7 @@ internal fun ArticlesPage(
     queueId: Long?,
     unread: Boolean,
     markingRead: Boolean,
-    onQueue: (Long?) -> Unit,
+    onQueueFilter: (Long?, Boolean) -> Unit,
     onUnread: () -> Unit,
     onMarkAllRead: () -> Unit,
     onAdd: () -> Unit,
@@ -49,10 +50,12 @@ internal fun ArticlesPage(
     modifier: Modifier = Modifier,
     showQueuePicker: Boolean = true,
     loading: Boolean = false,
+    unassignedOnly: Boolean = false,
+    onDismissQueueArticles: ((Boolean) -> Unit)? = null,
 ) {
     val queue = snapshot.queues.firstOrNull { it.id == queueId }
     var confirmMarkAllRead by rememberSaveable { mutableStateOf(false) }
-    val listState = key(queueId, unread) { rememberLazyListState() }
+    val listState = key(queueId, unread, unassignedOnly) { rememberLazyListState() }
     Column(modifier) {
         PageHeading(queue?.name ?: "記事") {
             FilterChip(selected = unread, onClick = onUnread, label = { Text("未読のみ") })
@@ -60,19 +63,35 @@ internal fun ArticlesPage(
                 onClick = { confirmMarkAllRead = true },
                 enabled = !loading && !markingRead && snapshot.hasUnread,
             ) { Text("すべて既読にする") }
+            if (onDismissQueueArticles != null) {
+                TextButton(onClick = { onDismissQueueArticles(unread) }, enabled = !loading && snapshot.articles.isNotEmpty()) {
+                    Text("一括削除")
+                }
+            }
         }
-        if (showQueuePicker && snapshot.queues.isNotEmpty()) {
+        if (showQueuePicker && (snapshot.subscriptions.isNotEmpty() || snapshot.queues.isNotEmpty())) {
             LazyRow(
                 contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 8.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 item {
-                    FilterChip(selected = queueId == null, onClick = { onQueue(null) }, label = { Text("すべて") })
+                    FilterChip(
+                        selected = queueId == null && !unassignedOnly,
+                        onClick = { onQueueFilter(null, false) },
+                        label = { Text("すべて") },
+                    )
+                }
+                item {
+                    FilterChip(
+                        selected = unassignedOnly,
+                        onClick = { onQueueFilter(null, true) },
+                        label = { Text(UNASSIGNED_FILTER_LABEL) },
+                    )
                 }
                 items(snapshot.queues, key = { it.id }) { queue ->
                     FilterChip(
                         selected = queue.id == queueId,
-                        onClick = { onQueue(queue.id) },
+                        onClick = { onQueueFilter(queue.id, false) },
                         label = { Text(queue.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                         modifier = Modifier.widthIn(max = 220.dp),
                     )
@@ -87,7 +106,9 @@ internal fun ArticlesPage(
             val title = when {
                 snapshot.subscriptions.isEmpty() -> "最初のフィードを登録"
                 emptyQueue -> "このキューにフィードがありません"
+                unassignedOnly && snapshot.subscriptions.all { it.queueIds.isNotEmpty() } -> "キュー未設定のフィードがありません"
                 unread -> "未読の記事はありません"
+                unassignedOnly -> "キュー未設定の記事がありません"
                 queueId != null -> "このキューに記事がありません"
                 else -> "まだ記事がありません"
             }
@@ -105,10 +126,15 @@ internal fun ArticlesPage(
         }
     }
     if (confirmMarkAllRead) {
+        val message = when {
+            unassignedOnly -> "キュー未設定のフィードの未読記事をすべて既読にします。"
+            queue != null -> "「${queue.name}」の未読記事を既読にします。"
+            else -> "この一覧の未読記事をすべて既読にします。"
+        }
         AlertDialog(
             onDismissRequest = { confirmMarkAllRead = false },
             title = { Text("すべて既読にしますか？") },
-            text = { Text(queue?.let { "「${it.name}」の未読記事を既読にします。" } ?: "この一覧の未読記事をすべて既読にします。") },
+            text = { Text(message) },
             confirmButton = {
                 TextButton(onClick = {
                     confirmMarkAllRead = false
@@ -127,6 +153,7 @@ internal fun QueueArticlesPage(
     revision: Int,
     markingRead: Boolean,
     onMarkAllRead: () -> Unit,
+    onDismissQueueArticles: (Boolean) -> Unit,
     onAdd: () -> Unit,
     onArticle: (Article, ArticlePress) -> Unit,
     onDismiss: suspend (Article, ArticleRating?) -> Boolean,
@@ -154,9 +181,10 @@ internal fun QueueArticlesPage(
         content == null -> LoadingIndicator("キューの記事を読み込み中")
         else -> ArticlesPage(
             content, queueId, unread, markingRead,
-            onQueue = {}, onUnread = { unread = !unread; limit = 75 }, onMarkAllRead = onMarkAllRead,
+            onQueueFilter = { _, _ -> }, onUnread = { unread = !unread; limit = 75 }, onMarkAllRead = onMarkAllRead,
             onAdd = onAdd, onMore = { limit += 75 }, onArticle = onArticle, onDismiss = onDismiss,
             modifier = modifier, showQueuePicker = false, loading = unread != loadedUnread,
+            onDismissQueueArticles = onDismissQueueArticles,
         )
     }
 }
@@ -171,11 +199,17 @@ fun ArticlePage(
     onOpen: (String) -> Unit,
     onShare: (String, String) -> Unit,
     modifier: Modifier = Modifier,
+    onFetchFullText: (() -> Unit)? = null,
+    fetchingFullText: Boolean = false,
 ) {
     val metadata = rememberArticleMetadata(article.url)
     val image = rememberArticleImage(metadata?.imageUrl, article.thumbnailUrl)
     val title = metadata?.title ?: article.displayTitle
     val articleUrl = article.url?.takeIf { webUrl(it) != null }
+    val canRate = !article.dismissed || (article.originalOpenedAt != null && article.rating == null)
+    val paragraphs = remember(article.archivedBody) {
+        article.archivedBody?.split("\n\n")?.flatMap { it.chunked(3500) }
+    }
     LazyColumn(modifier, contentPadding = pagePadding, verticalArrangement = Arrangement.spacedBy(18.dp)) {
         item {
             TextButton(onFeed, contentPadding = PaddingValues(0.dp)) {
@@ -192,51 +226,78 @@ fun ArticlePage(
                 Spacer(Modifier.height(8.dp))
                 Text(date, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
+            articleUrl?.let { url ->
+                Spacer(Modifier.height(12.dp))
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = { onOpen(url) }) { Text("元記事") }
+                    OutlinedButton(onClick = { onShare(title, url) }) { Text("共有") }
+                }
+            }
         }
         item {
             ArticleThumbnail(image, Modifier.fillMaxWidth().aspectRatio(16f / 9f))
         }
-        item {
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                articleUrl?.let { url ->
-                    FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalArrangement = Arrangement.spacedBy(4.dp),
-                    ) {
-                        Button(onClick = { onOpen(url) }) { Text("元の記事を開く") }
-                        OutlinedButton(onClick = { onShare(title, url) }) { Text("共有") }
+        if (paragraphs != null) {
+            items(paragraphs) { paragraph ->
+                SelectionContainer { Text(paragraph, style = MaterialTheme.typography.bodyLarge) }
+            }
+        } else {
+            item {
+                Column {
+                    SelectionContainer {
+                        Text(
+                            metadata?.description ?: article.body ?: "説明文はありません。",
+                            style = MaterialTheme.typography.bodyLarge,
+                        )
                     }
-                }
-                TextButton(onClick = { onReadChange(!article.read) }) {
-                    Text(if (article.read) "未読に戻す" else "既読にする")
-                }
-                if (article.dismissed) {
-                    Text(
-                        article.rating?.let { "${it.label} ・ キューから削除済み" } ?: "キューから削除済み",
-                        Modifier.announceStatus(),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                } else {
-                    FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalArrangement = Arrangement.spacedBy(4.dp),
-                    ) {
-                        ArticleRating.entries.forEach { rating ->
-                            OutlinedButton(onClick = { onRate(rating) }) { Text("${rating.label} と評価") }
+                    if (onFetchFullText != null) {
+                        TextButton(onClick = onFetchFullText, enabled = !fetchingFullText) {
+                            Text(if (fetchingFullText) "全文を取得中" else "全文を取得")
                         }
                     }
-                    TextButton(onRemove) { Text("すべてのキューから削除") }
                 }
             }
-            HorizontalDivider()
         }
         item {
-            SelectionContainer {
-                Text(
-                    metadata?.description ?: article.body ?: "説明文はありません。",
-                    style = MaterialTheme.typography.bodyLarge,
-                )
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                HorizontalDivider()
+                if (article.dismissed && canRate) {
+                    Text(
+                        "元記事を開いた・キューから削除済み", Modifier.announceStatus(),
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                FlowRow(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    itemVerticalAlignment = Alignment.CenterVertically,
+                ) {
+                    if (!canRate) {
+                        Text(
+                            article.rating?.let { "${it.label} ・ キューから削除済み" } ?: "キューから削除済み",
+                            Modifier.announceStatus(),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    } else {
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            ArticleRating.entries.forEach { rating ->
+                                OutlinedButton(
+                                    onClick = { onRate(rating) },
+                                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+                                ) { Text(rating.label) }
+                            }
+                        }
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        TextButton(onClick = { onReadChange(!article.read) }) {
+                            Text(if (article.read) "未読に戻す" else "既読にする")
+                        }
+                        if (!article.dismissed) {
+                            RowMenu("その他の操作", listOf("すべてのキューから削除" to onRemove))
+                        }
+                    }
+                }
             }
         }
     }
@@ -309,7 +370,7 @@ internal fun FeedsPage(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 FilterChip(selected = favoritesOnly, onClick = onFavoritesOnly, label = { Text("お気に入りのみ") })
-                FilterChip(selected = unassignedOnly, onClick = onUnassignedOnly, label = { Text("キュー未設定のみ") })
+                FilterChip(selected = unassignedOnly, onClick = onUnassignedOnly, label = { Text(UNASSIGNED_FILTER_LABEL) })
             }
             Box(Modifier.align(Alignment.End).padding(end = 12.dp)) {
                 FeedOrderMenu(order, onOrder)
@@ -474,14 +535,8 @@ internal fun articleTimestampLabel(
     changeDetectedAt: Long? = null,
     discoveredAt: Long?,
 ): String? {
-    val (label, time) = when {
-        updatedAt != null -> "更新" to updatedAt
-        changeDetectedAt != null -> "更新検知" to changeDetectedAt
-        publishedTime != null -> "公開" to publishedTime
-        discoveredAt != null -> "更新検知" to discoveredAt
-        else -> return null
-    }
-    return "$label ${articleTimestampFormat.format(Instant.ofEpochMilli(time).atZone(ZoneId.systemDefault()))}"
+    val time = updatedAt ?: changeDetectedAt ?: publishedTime ?: discoveredAt ?: return null
+    return articleTimestampFormat.format(Instant.ofEpochMilli(time).atZone(ZoneId.systemDefault()))
 }
 
 private fun hostLabel(url: String): String = java.net.URI(url).host ?: url

@@ -28,12 +28,16 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import java.io.IOException
+import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
 
 class QarryApplication : Application() {
     val library: FeedLibrary by lazy {
-        FeedLibrary(FeedStore(this).apply { setWriteAheadLoggingEnabled(true) }, FeedClient())
+        FeedLibrary(
+            FeedStore(this).apply { setWriteAheadLoggingEnabled(true) }, FeedClient(),
+            File(noBackupFilesDir, "bekko-a8m-c721113"),
+        )
     }
 
     override fun onCreate() {
@@ -59,7 +63,9 @@ class FeedRefreshService : JobService() {
         refreshJob = scope.launch {
             var retry = false
             try {
-                (application as QarryApplication).library.refresh()
+                val library = (application as QarryApplication).library
+                library.refresh()
+                library.archive.fetchPending()
             } catch (_: SQLiteException) {
                 Log.w(FEED_LOG, "Background refresh could not access the database")
                 retry = true
@@ -82,7 +88,8 @@ class FeedRefreshService : JobService() {
     }
 }
 
-class FeedLibrary(private val store: FeedStore, private val client: FeedClient) {
+class FeedLibrary(private val store: FeedStore, private val client: FeedClient, modelDir: File? = null) {
+    internal val archive = ArticleArchive(store, client, modelDir)
     private val changes = MutableStateFlow(0)
     val revision = changes.asStateFlow()
     private val activeRefresh = MutableStateFlow(false)
@@ -91,8 +98,8 @@ class FeedLibrary(private val store: FeedStore, private val client: FeedClient) 
     private val metadataLookups = LruCache<String, MetadataLookup>(256)
     private val metadataConnections = Semaphore(3)
 
-    suspend fun load(queueId: Long?, unreadOnly: Boolean, limit: Int): LibrarySnapshot =
-        runInterruptible(Dispatchers.IO) { store.load(queueId, unreadOnly, limit) }
+    suspend fun load(queueId: Long?, unreadOnly: Boolean, limit: Int, unassignedOnly: Boolean = false): LibrarySnapshot =
+        runInterruptible(Dispatchers.IO) { store.load(queueId, unreadOnly, limit, unassignedOnly) }
 
     suspend fun article(id: Long): Article? = runInterruptible(Dispatchers.IO) { store.article(id) }
 
@@ -168,9 +175,17 @@ class FeedLibrary(private val store: FeedStore, private val client: FeedClient) 
     suspend fun removeFeed(id: Long): Unit = change { store.removeFeed(id) }
     suspend fun setFeedFavorite(id: Long, favorite: Boolean): Unit = change { store.setFeedFavorite(id, favorite) }
     suspend fun markRead(id: Long, read: Boolean): Unit = change { store.setRead(id, read) }
-    suspend fun markAllRead(queueId: Long?): Int = change { store.markAllRead(queueId) }
+    suspend fun markAllRead(queueId: Long?, unassignedOnly: Boolean = false): Int =
+        change { store.markAllRead(queueId, unassignedOnly) }
     suspend fun recordView(id: Long): Unit = change { store.recordView(id) }
-    suspend fun dismissArticle(id: Long, rating: ArticleRating?): Unit = change { store.dismissArticle(id, rating) }
+    suspend fun recordOriginalOpen(id: Long, queueId: Long?): Unit = change { store.recordOriginalOpen(id, queueId) }
+    internal suspend fun recordArchivedOriginalOpen(key: RatingKey, url: String): Unit =
+        change { store.recordArchivedOriginalOpen(key, url) }
+    suspend fun dismissArticle(id: Long, rating: ArticleRating?, queueId: Long?): Unit =
+        change { store.dismissArticle(id, rating, queueId) }
+    suspend fun dismissQueueArticles(queueId: Long, unreadOnly: Boolean): Int =
+        change { store.dismissQueueArticles(queueId, unreadOnly) }
+    suspend fun dismissFeedArticles(feedId: Long): Int = change { store.dismissFeedArticles(feedId) }
     internal suspend fun changeRating(key: RatingKey, rating: ArticleRating?): Unit = change { store.changeRating(key, rating) }
 
     suspend fun refresh(onlyFeed: Long? = null) {

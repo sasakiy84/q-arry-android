@@ -12,6 +12,8 @@ import androidx.compose.runtime.saveable.rememberSaveable
 internal sealed interface DeleteTarget {
     data class Feed(val id: Long) : DeleteTarget
     data class Queue(val id: Long) : DeleteTarget
+    data class FeedArticles(val feedId: Long) : DeleteTarget
+    data class QueueArticles(val queueId: Long, val unreadOnly: Boolean) : DeleteTarget
 }
 
 internal class LibraryDialogState(
@@ -45,6 +47,7 @@ internal fun LibraryDialogs(
     listStates: SaveableStateHolder,
     library: FeedLibrary,
     change: (suspend () -> Unit) -> Unit,
+    onArticlesRemoved: suspend (Int) -> Unit,
     onQueueRemoved: (Long) -> Unit,
 ) {
     state.queueEditor?.let { editor ->
@@ -103,11 +106,24 @@ internal fun LibraryDialogs(
         )
     }
     state.confirmDelete?.let { target ->
-        val isFeed = target is DeleteTarget.Feed
+        val (title, message, confirm) = when (target) {
+            is DeleteTarget.Feed -> Triple(
+                "フィードを解除しますか？", "このフィードの記事とキューへの登録が端末から削除されます。", "解除",
+            )
+            is DeleteTarget.Queue -> Triple(
+                "キューを削除しますか？", "フィードと記事は購読一覧に残ります。", "削除",
+            )
+            is DeleteTarget.FeedArticles -> Triple(
+                "フィードの記事を一括削除しますか？", "このフィードの取得済みの記事を、すべてのキューから削除します。", "一括削除",
+            )
+            is DeleteTarget.QueueArticles -> Triple(
+                "キューの記事を一括削除しますか？", "この一覧の条件に合う記事を、すべてのキューから削除します。", "一括削除",
+            )
+        }
         AlertDialog(
             onDismissRequest = { state.confirmDelete = null },
-            title = { Text(if (isFeed) "フィードを解除しますか？" else "キューを削除しますか？") },
-            text = { Text(if (isFeed) "このフィードの記事とキューへの登録が端末から削除されます。" else "フィードと記事は購読一覧に残ります。") },
+            title = { Text(title) },
+            text = { Text(message) },
             confirmButton = {
                 TextButton(onClick = {
                     state.confirmDelete = null
@@ -120,9 +136,13 @@ internal fun LibraryDialogs(
                                 library.removeQueue(target.id)
                                 onQueueRemoved(target.id)
                             }
+                            is DeleteTarget.FeedArticles -> onArticlesRemoved(library.dismissFeedArticles(target.feedId))
+                            is DeleteTarget.QueueArticles -> onArticlesRemoved(
+                                library.dismissQueueArticles(target.queueId, target.unreadOnly),
+                            )
                         }
                     }
-                }) { Text(if (isFeed) "解除" else "削除") }
+                }) { Text(confirm) }
             },
             dismissButton = { TextButton(onClick = { state.confirmDelete = null }) { Text("キャンセル") } },
         )

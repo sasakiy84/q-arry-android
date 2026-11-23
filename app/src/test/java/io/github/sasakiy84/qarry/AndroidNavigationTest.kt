@@ -53,6 +53,63 @@ class AndroidFeedRegistrationTest {
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36], qualifiers = "ja-w360dp-h800dp-mdpi")
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
+class UnassignedQueueFilterTest {
+    @Test
+    fun filtersArticlesAndFeedsWithoutAQueueAndMarksOnlyThoseArticlesRead() = withLibrary { store, library ->
+        store.queueName(null, "資料キュー")
+        val queue = store.load(null, false, 10).queues.single()
+        val queuedFeedId = store.subscribe(
+            FeedDocument(address, "キュー設定済み配信元", null, listOf(FeedArticle("assigned", "キュー設定済みの記事", null, null, 3000))),
+            queue.id,
+        )
+        val unassignedFeedId = store.subscribe(
+            FeedDocument("https://example.org/feed", "キュー未設定の配信元", null, listOf(
+                FeedArticle("unread", "キュー未設定の未読記事", null, null, 2000),
+                FeedArticle("read", "キュー未設定の既読記事", null, null, 1000),
+            )),
+            null,
+        )
+        val alreadyRead = store.feedArticles(unassignedFeedId, 10).articles.last()
+        store.setRead(alreadyRead.id, true)
+
+        Robolectric.buildActivity(ComponentActivity::class.java).setup().windowFocusChanged(true).use { controller ->
+            val activity = controller.get()
+            activity.setContent { MaterialTheme { QarryScreen(library) {} } }
+            val screen = ComposeScreen(activity.window.decorView)
+            fun shows(label: String) = screen.nodes().any { label in it.text() }
+
+            screen.find { "キュー設定済みの記事" in it.text() }
+            screen.tap("キュー未設定のみ")
+            screen.find { "キュー未設定の未読記事" in it.text() }
+            assertFalse(shows("キュー設定済みの記事"))
+            assertFalse(shows("キュー未設定の既読記事"))
+
+            screen.tap("未読のみ")
+            screen.find { "キュー未設定の既読記事" in it.text() }
+            assertFalse(shows("キュー設定済みの記事"))
+            screen.tap("すべて既読にする")
+            screen.dialogWith("キュー未設定のフィードの未読記事をすべて既読にします。").tap("既読にする")
+            screen.tap("未読のみ")
+            screen.text("未読の記事はありません")
+            assertFalse(store.feedArticles(queuedFeedId, 10).articles.single().read)
+
+            screen.tap("フィード")
+            screen.find { "キュー設定済み配信元" in it.text() }
+            screen.tap("キュー未設定のみ")
+            screen.find { "キュー未設定の配信元" in it.text() }
+            assertFalse(shows("キュー設定済み配信元"))
+
+            screen.tap("記事")
+            screen.text("未読の記事はありません")
+            screen.tap("すべて")
+            screen.find { "キュー設定済みの記事" in it.text() }
+        }
+    }
+}
+
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [36], qualifiers = "ja-w360dp-h800dp-mdpi")
+@GraphicsMode(GraphicsMode.Mode.NATIVE)
 class AndroidQueueNavigationTest {
     @Test
     fun queueAndFeedLinksReturnInTheOrderOpenedAndTabsKeepTheirFilters() = withLibrary { store, library ->
@@ -98,7 +155,8 @@ class AndroidQueueNavigationTest {
             screen.tap("未読のみ")
             screen.tapContaining("資料記事")
             screen.tap("テスト配信元")
-            screen.tap("購読を解除")
+            screen.tapDescription("フィードのその他の操作")
+            screen.dialogWith("フィードの操作").tap("購読を解除")
             screen.dialogWith("フィードを解除しますか？").tap("解除")
             screen.text("最初のフィードを登録")
             assertFalse(activity.onBackPressedDispatcher.hasEnabledCallbacks())
@@ -166,6 +224,48 @@ class AndroidPreviewLayoutTest {
 }
 
 private val address = "https://127.0.0.1:1/updates"
+
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [36], qualifiers = "ja-w360dp-h800dp-mdpi")
+@GraphicsMode(GraphicsMode.Mode.NATIVE)
+class BulkArticleRemovalTest {
+    @Test
+    fun confirmsRemovalFromAQueueAndFromAFeed() = withLibrary { store, library ->
+        store.queueName(null, "資料キュー")
+        val queue = store.load(null, false, 10).queues.single()
+        val feedId = store.subscribe(
+            FeedDocument(address, "まとめて整理するフィード", null, listOf(
+                FeedArticle("unread", "未読の資料記事", null, null, 2000),
+                FeedArticle("read", "既読の資料記事", null, null, 1000),
+            )),
+            queue.id,
+        )
+        store.setRead(store.feedArticles(feedId, 10).articles.last().id, true)
+        Robolectric.buildActivity(ComponentActivity::class.java).setup().windowFocusChanged(true).use { controller ->
+            val activity = controller.get()
+            activity.setContent { MaterialTheme { QarryScreen(library) {} } }
+            val screen = ComposeScreen(activity.window.decorView)
+
+            screen.tap("資料キュー")
+            screen.find { "未読の資料記事" in it.text() }
+            screen.tap("一括削除")
+            screen.dialogWith("キューの記事を一括削除しますか？").tap("一括削除")
+            screen.text("未読の記事はありません")
+            assertEquals("既読の資料記事", store.feedArticles(feedId, 10).articles.single().title)
+
+            screen.tap("フィード")
+            screen.tapContaining("まとめて整理するフィード")
+            screen.tap("一括削除")
+            screen.dialogWith("フィードの記事を一括削除しますか？").tap("キャンセル")
+            screen.find { "既読の資料記事" in it.text() }
+            screen.tap("一括削除")
+            screen.dialogWith("フィードの記事を一括削除しますか？").tap("一括削除")
+            screen.text("表示する記事がありません")
+            assertEquals(setOf(queue.id), store.subscriptions().single().queueIds)
+        }
+    }
+}
+
 private val html = """
     <title>登録テスト</title><main id="updates">
       <article><a href="/posts/1">最初の記事</a></article>

@@ -4,26 +4,28 @@ import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.AbsoluteAlignment
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.LineBreak
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
@@ -37,10 +39,12 @@ internal fun LazyListScope.articleCards(
     onArticle: (Article, ArticlePress) -> Unit,
     onDismiss: suspend (Article, ArticleRating?) -> Boolean,
     history: Boolean = false,
+    showFeedTitle: Boolean = true,
 ) {
     items(articles, key = { it.id }) { article ->
-        ArticleCard(article, history, { press -> onArticle(article, press) }, onDismiss)
-        HorizontalDivider(Modifier.padding(horizontal = 20.dp))
+        Box(Modifier.padding(horizontal = 12.dp, vertical = 4.dp)) {
+            ArticleCard(article, history, showFeedTitle, { press -> onArticle(article, press) }, onDismiss)
+        }
     }
 }
 
@@ -64,15 +68,24 @@ internal fun Modifier.articleOpenActions(
     )
 }
 
+private val articleCardShape = RoundedCornerShape(12.dp)
+
+private enum class ArticleSwipe(val label: String, val rating: ArticleRating?) {
+    Remove("削除", null),
+    Bad(ArticleRating.Bad.label, ArticleRating.Bad),
+    Good(ArticleRating.Good.label, ArticleRating.Good),
+}
+
 @Composable
 private fun ArticleCard(
     article: Article,
     history: Boolean,
+    showFeedTitle: Boolean,
     onOpen: (ArticlePress) -> Unit,
     onDismiss: suspend (Article, ArticleRating?) -> Boolean,
 ) {
     if (article.dismissed) {
-        ArticleCardContent(article, history, onOpen, null)
+        ArticleCardContent(article, history, showFeedTitle, onOpen, modifier = Modifier.clip(articleCardShape))
         return
     }
 
@@ -81,7 +94,15 @@ private fun ArticleCard(
     var width by remember { mutableIntStateOf(0) }
     var offset by remember { mutableFloatStateOf(0f) }
     var resetAnimation by remember { mutableStateOf<Job?>(null) }
-    val threshold = minOf(width * 0.45f, with(LocalDensity.current) { 192.dp.toPx() })
+    val (firstThreshold, secondThreshold) = with(LocalDensity.current) {
+        minOf(width * 0.28f, 104.dp.toPx()) to minOf(width * 0.46f, 168.dp.toPx())
+    }
+
+    fun swipeAction(displacement: Float): ArticleSwipe = when {
+        displacement > 0f -> ArticleSwipe.Remove
+        displacement <= -secondThreshold -> ArticleSwipe.Good
+        else -> ArticleSwipe.Bad
+    }
 
     fun resetPosition() {
         resetAnimation?.cancel()
@@ -106,59 +127,72 @@ private fun ArticleCard(
 
     val dismissLatest by rememberUpdatedState(::dismiss)
     Box(
-        Modifier.fillMaxWidth().clipToBounds().onSizeChanged { width = it.width }
-            .pointerInput(width, threshold, saving) {
-                if (saving) return@pointerInput
-                detectHorizontalDragGestures(
-                    onDragStart = {
-                        resetAnimation?.cancel()
-                        offset = 0f
-                    },
-                    onHorizontalDrag = { _, delta -> offset = (offset + delta).coerceIn(-width.toFloat(), width.toFloat()) },
-                    onDragCancel = ::resetPosition,
-                    onDragEnd = {
-                        if (threshold > 0f && abs(offset) >= threshold) {
-                            dismissLatest(if (offset > 0f) ArticleRating.Good else ArticleRating.Bad)
-                        } else {
-                            resetPosition()
+        Modifier.fillMaxWidth().clip(articleCardShape).onSizeChanged { width = it.width }
+            .pointerInput(width, firstThreshold, secondThreshold, saving) {
+                if (saving || width <= 0) return@pointerInput
+                val touchSlop = viewConfiguration.touchSlop
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    var swiping = false
+                    while (true) {
+                        val change = awaitPointerEvent().changes.singleOrNull() ?: break
+                        if (change.id != down.id || change.isConsumed) break
+                        val displacement = change.position - down.position
+                        if (!change.pressed) {
+                            if (swiping && abs(displacement.x) >= firstThreshold) {
+                                change.consume()
+                                dismissLatest(swipeAction(displacement.x).rating)
+                                return@awaitEachGesture
+                            }
+                            break
                         }
-                    },
-                )
+                        if (!swiping) {
+                            val horizontal = abs(displacement.x)
+                            val vertical = abs(displacement.y)
+                            // Let the list take over as soon as a diagonal gesture reaches the vertical touch slop.
+                            if (horizontal <= vertical * 1.5f) {
+                                if (vertical >= touchSlop) break
+                                continue
+                            }
+                            if (horizontal < touchSlop * 1.5f) continue
+                            resetAnimation?.cancel()
+                            swiping = true
+                        }
+                        offset = displacement.x.coerceIn(-width.toFloat(), width.toFloat())
+                        change.consume()
+                    }
+                    if (swiping) resetPosition()
+                }
             },
     ) {
         if (offset != 0f) {
-            val good = offset > 0f
-            val ready = abs(offset) >= threshold
+            val action = swipeAction(offset)
+            val ready = abs(offset) >= firstThreshold
             val colors = MaterialTheme.colorScheme
-            val background = when {
-                ready && good -> colors.primary
-                ready -> colors.error
-                good -> colors.primaryContainer
-                else -> colors.errorContainer
-            }
-            val textColor = when {
-                ready && good -> colors.onPrimary
-                ready -> colors.onError
-                good -> colors.onPrimaryContainer
-                else -> colors.onErrorContainer
+            val (background, textColor) = when (action) {
+                ArticleSwipe.Remove -> if (ready) colors.secondary to colors.onSecondary
+                    else colors.secondaryContainer to colors.onSecondaryContainer
+                ArticleSwipe.Bad -> if (ready) colors.error to colors.onError
+                    else colors.errorContainer to colors.onErrorContainer
+                ArticleSwipe.Good -> colors.primary to colors.onPrimary
             }
             Box(
-                Modifier.matchParentSize().background(background).padding(horizontal = 24.dp).clearAndSetSemantics { },
-                contentAlignment = if (good) AbsoluteAlignment.CenterLeft else AbsoluteAlignment.CenterRight,
+                Modifier.matchParentSize().background(background).padding(horizontal = 16.dp).clearAndSetSemantics { },
+                contentAlignment = if (action == ArticleSwipe.Remove) AbsoluteAlignment.CenterLeft else AbsoluteAlignment.CenterRight,
             ) {
-                val label = if (good) ArticleRating.Good.label else ArticleRating.Bad.label
                 Text(
-                    if (ready) "$label ✓" else label,
-                    color = textColor, style = MaterialTheme.typography.titleMedium,
+                    if (ready) "${action.label} ✓" else action.label,
+                    color = textColor, style = MaterialTheme.typography.titleSmall,
+                    maxLines = 1,
                 )
             }
         }
         ArticleCardContent(
             article,
             history,
+            showFeedTitle,
             onOpen,
-            onRemove = { dismiss(null) },
-            onRate = if (!saving) ({ rating -> dismiss(rating) }) else null,
+            onDismiss = if (saving) null else dismissLatest,
             modifier = Modifier.absoluteOffset { IntOffset(offset.roundToInt(), 0) },
         )
     }
@@ -168,9 +202,9 @@ private fun ArticleCard(
 private fun ArticleCardContent(
     article: Article,
     history: Boolean,
+    showFeedTitle: Boolean,
     onOpen: (ArticlePress) -> Unit,
-    onRemove: (() -> Unit)?,
-    onRate: ((ArticleRating) -> Unit)? = null,
+    onDismiss: ((ArticleRating?) -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     val metadata = rememberArticleMetadata(article.url)
@@ -179,71 +213,71 @@ private fun ArticleCardContent(
     val largeText = LocalDensity.current.fontScale >= 1.5f
     val title = metadata?.title ?: article.displayTitle
     val titleLines = if (largeText) 2 else 1
-    val height = with(LocalDensity.current) {
-        typography.labelMedium.lineHeight.toDp() + typography.labelSmall.lineHeight.toDp() +
-            typography.titleMedium.lineHeight.toDp() * titleLines +
-            typography.bodySmall.lineHeight.toDp() * 2 + typography.bodySmall.fontSize.toDp()
-    } + 36.dp
-    Row(
-        modifier.fillMaxWidth().heightIn(min = height).background(MaterialTheme.colorScheme.surface)
+    Column(
+        modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceContainer)
             .articleOpenActions(article.url, onOpen)
             .semantics {
-                if (onRate != null) customActions = ArticleRating.entries.map { rating ->
-                    CustomAccessibilityAction("${rating.label} と評価してすべてのキューから外す") {
-                        onRate(rating)
+                if (onDismiss != null) customActions = ArticleSwipe.entries.map { action ->
+                    val label = action.rating?.let { "${it.label} と評価してすべてのキューから削除" }
+                        ?: "すべてのキューから削除"
+                    CustomAccessibilityAction(label) {
+                        onDismiss(action.rating)
                         true
                     }
                 }
             }
-            .padding(start = 20.dp, end = 8.dp, top = 12.dp, bottom = 12.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalAlignment = Alignment.CenterVertically,
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(5.dp),
     ) {
-        Column(
-            Modifier.weight(1f).align(Alignment.Top),
-            verticalArrangement = Arrangement.spacedBy(4.dp),
+        Text(
+            title, style = typography.titleSmall.copy(lineBreak = LineBreak.Heading),
+            fontWeight = if (article.read) FontWeight.Medium else FontWeight.SemiBold,
+            minLines = titleLines, maxLines = titleLines, overflow = TextOverflow.Ellipsis,
+        )
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    article.feedTitle, Modifier.weight(1f),
-                    style = typography.labelMedium, color = MaterialTheme.colorScheme.primary,
-                    maxLines = 1, overflow = TextOverflow.Ellipsis,
-                )
-                val status = when {
-                    article.rating != null -> article.rating.label
-                    history -> article.viewedAt?.let(::entryDate)
-                    !article.read -> "未読"
-                    else -> null
-                }
-                status?.let {
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                val date = article.timestampLabel(metadata)
+                if (largeText) {
                     Text(
-                        it, style = typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        date.orEmpty(), style = typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1, overflow = TextOverflow.Ellipsis,
                     )
                 }
-            }
-            Text(
-                title, style = typography.titleMedium,
-                fontWeight = if (article.read) FontWeight.Medium else FontWeight.SemiBold,
-                maxLines = titleLines, overflow = TextOverflow.Ellipsis,
-            )
-            article.timestampLabel(metadata)?.let { date ->
-                Text(date, style = typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
-            }
-            (metadata?.description ?: article.body)?.let { description ->
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    if (!largeText && date != null) {
+                        Text(date, style = typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+                    }
+                    if (showFeedTitle) {
+                        Text(
+                            article.feedTitle, Modifier.weight(1f),
+                            style = typography.labelSmall, color = MaterialTheme.colorScheme.primary,
+                            maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    val status = when {
+                        article.rating != null -> article.rating.label
+                        history -> article.viewedAt?.let(::entryDate)
+                        !article.read -> "未読"
+                        else -> null
+                    }
+                    status?.let {
+                        Text(
+                            it, style = typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
                 Text(
-                    description.trim(), style = typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 2, overflow = TextOverflow.Ellipsis,
+                    (metadata?.description ?: article.body).orEmpty().trim(),
+                    style = typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    minLines = 2, maxLines = 2, overflow = TextOverflow.Ellipsis,
                 )
             }
-        }
-        ArticleThumbnail(image, if (largeText) Modifier.size(48.dp) else Modifier.size(width = 76.dp, height = 60.dp))
-        if (onRemove != null) {
-            IconButton(onClick = onRemove) {
-                Icon(painterResource(R.drawable.ic_delete), contentDescription = "「$title」をすべてのキューから削除")
-            }
-        } else {
-            Spacer(Modifier.width(48.dp))
+            ArticleThumbnail(image, Modifier.width(if (largeText) 80.dp else 96.dp).aspectRatio(16f / 9f))
         }
     }
 }

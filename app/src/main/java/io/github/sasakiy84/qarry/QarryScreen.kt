@@ -35,6 +35,7 @@ private enum class Section(val title: String, val icon: Int) {
 
 private enum class DetailKind { Article, Feed, Queue }
 private data class DetailRoute(val kind: DetailKind, val id: Long)
+private data class ArticleListFilter(val queueId: Long?, val unreadOnly: Boolean, val unassignedOnly: Boolean)
 
 private fun DetailRoute.stateKey(index: Int): String = "detail-$index-${kind.name}-$id"
 
@@ -50,13 +51,16 @@ private val detailPathSaver = listSaver<List<DetailRoute>, String>(
 internal fun QarryScreen(library: FeedLibrary, onArticleOpenMode: (ArticleOpenMode) -> Unit) {
     var section by rememberSaveable { mutableStateOf(Section.Articles) }
     var queueId by rememberSaveable { mutableStateOf<Long?>(null) }
+    var articlesUnassignedOnly by rememberSaveable { mutableStateOf(false) }
     var detailPath by rememberSaveable(stateSaver = detailPathSaver) { mutableStateOf(emptyList<DetailRoute>()) }
     var unread by rememberSaveable { mutableStateOf(true) }
     var markingRead by remember { mutableStateOf(false) }
-    var unassignedOnly by rememberSaveable { mutableStateOf(false) }
+    var feedsUnassignedOnly by rememberSaveable { mutableStateOf(false) }
     var favoritesOnly by rememberSaveable { mutableStateOf(false) }
     var feedOrder by rememberSaveable { mutableStateOf(FeedOrder.Name) }
     var adding by rememberSaveable { mutableStateOf(false) }
+    var searching by rememberSaveable { mutableStateOf(false) }
+    var archivingArticle by remember { mutableStateOf<Long?>(null) }
     var editingWebsiteScope by rememberSaveable { mutableStateOf(false) }
     var savingFeedSetup by remember { mutableStateOf(false) }
     var limit by rememberSaveable { mutableIntStateOf(75) }
@@ -65,23 +69,28 @@ internal fun QarryScreen(library: FeedLibrary, onArticleOpenMode: (ArticleOpenMo
     var ratingLimit by rememberSaveable { mutableIntStateOf(75) }
     val listStates = rememberSaveableStateHolder()
     var snapshot by remember { mutableStateOf<LibrarySnapshot?>(null) }
-    var loadedArticleFilter by remember { mutableStateOf<Pair<Long?, Boolean>?>(null) }
+    var loadedArticleFilter by remember { mutableStateOf<ArticleListFilter?>(null) }
     var article by remember { mutableStateOf<Article?>(null) }
     var history by remember { mutableStateOf<ArticleListing?>(null) }
     var pendingArticleView by remember { mutableStateOf<Job?>(null) }
     var ratings by remember { mutableStateOf<RatingListing?>(null) }
     val dialogs = rememberLibraryDialogState()
     val revision by library.revision.collectAsState()
+    val archiveRevision by library.archive.revision.collectAsState()
     val refreshing by library.refreshing.collectAsState()
     val snackbars = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     val backDispatcher = LocalOnBackPressedDispatcherOwner.current?.onBackPressedDispatcher
     val articleOpenMode = LocalArticleOpenMode.current
+    val articleFilter = ArticleListFilter(queueId, unread, articlesUnassignedOnly)
     val detail = detailPath.lastOrNull()
     val articleId = detail?.id?.takeIf { detail.kind == DetailKind.Article }
     val feedId = detail?.id?.takeIf { detail.kind == DetailKind.Feed }
     val openedQueueId = detail?.id?.takeIf { detail.kind == DetailKind.Queue }
+    val sourceQueueId = detailPath.lastOrNull { it.kind != DetailKind.Article }
+        ?.takeIf { it.kind == DetailKind.Queue }?.id
+        ?: queueId.takeIf { !searching && section == Section.Articles && detailPath.all { it.kind == DetailKind.Article } }
 
     fun change(action: suspend () -> Unit): Job = scope.launch {
         try {
@@ -105,10 +114,13 @@ internal fun QarryScreen(library: FeedLibrary, onArticleOpenMode: (ArticleOpenMo
         updateDetailPath(detailPath + route)
     }
 
-    fun openArticle(id: Long?, url: String?, press: ArticlePress, summary: Article? = null) {
+    fun openArticle(id: Long?, url: String?, press: ArticlePress, summary: Article? = null, archivedKey: RatingKey? = null) {
         val browser = articleOpenMode.forPress(press) == ArticleOpenMode.Browser || id == null
         if (browser && url != null && context.openArticleInBrowser(url)) {
-            if (id != null) change { library.recordView(id) }
+            pendingArticleView = change {
+                if (id != null) library.recordOriginalOpen(id, sourceQueueId)
+                else if (archivedKey != null) library.recordArchivedOriginalOpen(archivedKey, url)
+            }
         } else if (id != null) {
             if (section == Section.Settings && settingsTab == SettingsTab.Viewed && detailPath.isEmpty()) history = null
             if (summary != null) article = summary.copy(read = true)
@@ -125,14 +137,17 @@ internal fun QarryScreen(library: FeedLibrary, onArticleOpenMode: (ArticleOpenMo
 
     fun openQueue(id: Long) = navigateTo(DetailRoute(DetailKind.Queue, id))
 
-    fun openLink(address: String) {
-        webUrl(address)?.let { safeUrl ->
-            try {
-                context.startActivity(Intent(Intent.ACTION_VIEW, safeUrl.toUri()))
-            } catch (_: ActivityNotFoundException) {
-                change { snackbars.showSnackbar("URLを開けるアプリがありません。") }
-            }
+    fun openLink(address: String): Boolean {
+        val safeUrl = webUrl(address) ?: return false
+        try {
+            context.startActivity(Intent(Intent.ACTION_VIEW, safeUrl.toUri()))
+            return true
+        } catch (_: ActivityNotFoundException) {
+            change { snackbars.showSnackbar("URLを開けるアプリがありません。") }
+        } catch (_: SecurityException) {
+            change { snackbars.showSnackbar("URLを開けませんでした。") }
         }
+        return false
     }
 
     fun shareArticle(title: String, address: String) {
@@ -145,7 +160,7 @@ internal fun QarryScreen(library: FeedLibrary, onArticleOpenMode: (ArticleOpenMo
     }
 
     suspend fun dismissArticle(selected: Article, rating: ArticleRating?): Boolean = try {
-        library.dismissArticle(selected.id, rating)
+        library.dismissArticle(selected.id, rating, sourceQueueId)
         true
     } catch (_: android.database.sqlite.SQLiteException) {
         change { snackbars.showSnackbar("記事を保存または削除できませんでした。") }
@@ -154,19 +169,19 @@ internal fun QarryScreen(library: FeedLibrary, onArticleOpenMode: (ArticleOpenMo
 
     val opml = rememberOpmlTransfer(library, snackbars, ::change)
 
-    LaunchedEffect(revision, queueId, unread, limit) {
+    LaunchedEffect(revision, articleFilter, limit) {
         try {
-            val filter = queueId to unread
-            val loaded = library.load(filter.first, filter.second, limit)
-            if (queueId != null && loaded.queues.none { it.id == queueId }) queueId = null
+            val (requestedQueue, unreadOnly, unassignedOnly) = articleFilter
+            val loaded = library.load(requestedQueue, unreadOnly, limit, unassignedOnly)
+            if (requestedQueue != null && loaded.queues.none { it.id == requestedQueue }) queueId = null
             snapshot = loaded
-            loadedArticleFilter = filter
+            loadedArticleFilter = articleFilter
         } catch (_: android.database.sqlite.SQLiteException) {
             snackbars.showSnackbar("端末のデータを読み込めませんでした。")
         }
     }
 
-    LaunchedEffect(articleId, detail, adding, section, revision, settingsTab, historyLimit, ratingLimit) {
+    LaunchedEffect(articleId, detail, adding, section, revision, archiveRevision.takeIf { articleId != null }, settingsTab, historyLimit, ratingLimit) {
         try {
             when {
                 articleId != null -> {
@@ -188,18 +203,19 @@ internal fun QarryScreen(library: FeedLibrary, onArticleOpenMode: (ArticleOpenMo
         }
     }
 
-    fun chooseQueue(id: Long?) {
-        if (queueId == id) return
+    fun chooseQueue(id: Long?, unassignedOnly: Boolean = false) {
+        if (queueId == id && articlesUnassignedOnly == unassignedOnly) return
         queueId = id
+        articlesUnassignedOnly = unassignedOnly
         limit = 75
     }
 
-    fun markAllRead(selectedQueue: Long?) {
+    fun markAllRead(selectedQueue: Long?, unassignedOnly: Boolean = false) {
         if (markingRead) return
         markingRead = true
         change {
             val count = try {
-                library.markAllRead(selectedQueue)
+                library.markAllRead(selectedQueue, unassignedOnly)
             } finally {
                 markingRead = false
             }
@@ -213,12 +229,13 @@ internal fun QarryScreen(library: FeedLibrary, onArticleOpenMode: (ArticleOpenMo
             adding -> adding = false
             editingWebsiteScope -> editingWebsiteScope = false
             detailPath.isNotEmpty() -> updateDetailPath(detailPath.dropLast(1))
+            searching -> searching = false
             section != Section.Articles -> section = Section.Articles
         }
     }
 
-    BackHandler(adding || detail != null || section != Section.Articles) { back() }
-    val fullScreen = adding || detail != null
+    BackHandler(adding || searching || detail != null || section != Section.Articles) { back() }
+    val fullScreen = adding || searching || detail != null
     Scaffold(
         topBar = {
             TopAppBar(
@@ -230,6 +247,7 @@ internal fun QarryScreen(library: FeedLibrary, onArticleOpenMode: (ArticleOpenMo
                                 editingWebsiteScope -> "監視範囲を変更"
                                 feedId != null -> "フィード詳細"
                                 openedQueueId != null -> "キュー"
+                                searching && detail == null -> "記事検索"
                                 else -> "記事"
                             },
                             style = MaterialTheme.typography.titleMedium,
@@ -254,6 +272,11 @@ internal fun QarryScreen(library: FeedLibrary, onArticleOpenMode: (ArticleOpenMo
                     }
                 },
                 actions = {
+                    if (!fullScreen && section == Section.Articles) {
+                        IconButton(onClick = { searching = true }) {
+                            Icon(painterResource(R.drawable.ic_search), "記事検索")
+                        }
+                    }
                     if (!fullScreen && snapshot?.subscriptions.orEmpty().isNotEmpty()) {
                         IconButton(onClick = { change { library.refresh() } }, enabled = !refreshing) {
                             Icon(painterResource(R.drawable.ic_refresh), "フィードを更新")
@@ -314,11 +337,32 @@ internal fun QarryScreen(library: FeedLibrary, onArticleOpenMode: (ArticleOpenMo
                                 },
                                 onRate = { rating -> change { dismissArticle(opened, rating) } },
                                 onReadChange = { read -> change { library.markRead(opened.id, read) } },
-                                onOpen = ::openLink,
+                                onOpen = { url ->
+                                    if (openLink(url)) {
+                                        pendingArticleView = change { library.recordOriginalOpen(opened.id, sourceQueueId) }
+                                    }
+                                },
                                 onShare = ::shareArticle,
+                                onFetchFullText = if (opened.archivedBody == null && httpsUrl(opened.url) != null) ({
+                                    if (archivingArticle == null) {
+                                        archivingArticle = opened.id
+                                        change {
+                                            val saved = try {
+                                                library.archive.fetchArticle(opened)
+                                            } finally {
+                                                archivingArticle = null
+                                            }
+                                            snackbars.showSnackbar(if (saved) "本文を保存しました" else "本文を取得できませんでした")
+                                        }
+                                    }
+                                }) else null,
+                                fetchingFullText = archivingArticle == opened.id,
                                 modifier = page,
                             )
                         }
+                    }
+                    searching && detail == null -> listStates.SaveableStateProvider("article-search") {
+                        ArticleSearchPage(library.archive, revision, onArticle, page)
                     }
                     section == Section.Settings && detail == null -> listStates.SaveableStateProvider("settings-${settingsTab.name}") {
                         SettingsPage(
@@ -330,10 +374,12 @@ internal fun QarryScreen(library: FeedLibrary, onArticleOpenMode: (ArticleOpenMo
                             choosingFile = opml.choosingFile,
                             onImport = opml.onImport,
                             onExport = opml.onExport,
+                            archive = library.archive,
+                            libraryRevision = revision,
                             viewed = history,
                             rated = ratings,
                             onArticle = onArticle,
-                            onRatedArticle = { rated, press -> openArticle(rated.articleId, rated.url, press) },
+                            onRatedArticle = { rated, press -> openArticle(rated.articleId, rated.url, press, archivedKey = rated.key) },
                             onDismiss = ::dismissArticle,
                             onChangeRating = { key, rating -> change { library.changeRating(key, rating) } },
                             onMore = {
@@ -355,6 +401,9 @@ internal fun QarryScreen(library: FeedLibrary, onArticleOpenMode: (ArticleOpenMo
                             QueueArticlesPage(
                                 library, openedQueueId, revision, markingRead,
                                 onMarkAllRead = { markAllRead(openedQueueId) },
+                                onDismissQueueArticles = { unreadOnly ->
+                                    dialogs.confirmDelete = DeleteTarget.QueueArticles(openedQueueId, unreadOnly)
+                                },
                                 onAdd = { adding = true }, onArticle = onArticle, onDismiss = ::dismissArticle,
                                 modifier = page,
                             )
@@ -387,7 +436,7 @@ internal fun QarryScreen(library: FeedLibrary, onArticleOpenMode: (ArticleOpenMo
                                     library = library,
                                     revision = revision,
                                     refreshing = refreshing,
-                                    onLink = ::openLink,
+                                    onLink = { openLink(it) },
                                     onQueue = ::openQueue,
                                     onManage = { dialogs.managedFeedId = feed.id },
                                     onKeywordFilter = { dialogs.filteredFeedId = feed.id },
@@ -395,6 +444,7 @@ internal fun QarryScreen(library: FeedLibrary, onArticleOpenMode: (ArticleOpenMo
                                     onRefresh = { change { library.refresh(feed.id) } },
                                     onChangeWebsiteScope = { editingWebsiteScope = true },
                                     onUnsubscribe = { dialogs.confirmDelete = DeleteTarget.Feed(feed.id) },
+                                    onDismissFeedArticles = { dialogs.confirmDelete = DeleteTarget.FeedArticles(feed.id) },
                                     onArticle = onArticle,
                                     onDismiss = ::dismissArticle,
                                     modifier = page,
@@ -406,15 +456,19 @@ internal fun QarryScreen(library: FeedLibrary, onArticleOpenMode: (ArticleOpenMo
                         ArticlesPage(
                             content, queueId, unread,
                             markingRead = markingRead,
-                            onQueue = ::chooseQueue,
+                            onQueueFilter = ::chooseQueue,
                             onUnread = { unread = !unread; limit = 75 },
-                            onMarkAllRead = { markAllRead(queueId) },
+                            onMarkAllRead = { markAllRead(queueId, articlesUnassignedOnly) },
                             onAdd = { adding = true },
                             onMore = { limit += 75 },
                             onArticle = onArticle,
                             onDismiss = ::dismissArticle,
                             modifier = page,
-                            loading = loadedArticleFilter != (queueId to unread),
+                            loading = loadedArticleFilter != articleFilter,
+                            unassignedOnly = articlesUnassignedOnly,
+                            onDismissQueueArticles = queueId?.let { selectedQueue ->
+                                { unreadOnly -> dialogs.confirmDelete = DeleteTarget.QueueArticles(selectedQueue, unreadOnly) }
+                            },
                         )
                     }
                     section == Section.Queues -> listStates.SaveableStateProvider("queues") {
@@ -430,8 +484,8 @@ internal fun QarryScreen(library: FeedLibrary, onArticleOpenMode: (ArticleOpenMo
                     else -> listStates.SaveableStateProvider("feeds") {
                         FeedsPage(
                             content, refreshing,
-                            unassignedOnly = unassignedOnly,
-                            onUnassignedOnly = { unassignedOnly = !unassignedOnly },
+                            unassignedOnly = feedsUnassignedOnly,
+                            onUnassignedOnly = { feedsUnassignedOnly = !feedsUnassignedOnly },
                             favoritesOnly = favoritesOnly,
                             onFavoritesOnly = { favoritesOnly = !favoritesOnly },
                             order = feedOrder,
@@ -449,7 +503,9 @@ internal fun QarryScreen(library: FeedLibrary, onArticleOpenMode: (ArticleOpenMo
         }
     }
 
-    LibraryDialogs(dialogs, snapshot, listStates, library, ::change) { removedQueueId ->
+    LibraryDialogs(dialogs, snapshot, listStates, library, ::change, onArticlesRemoved = { count ->
+        snackbars.showSnackbar(if (count == 0) "削除する記事はありません" else "${count}件をすべてのキューから削除しました")
+    }) { removedQueueId ->
         if (queueId == removedQueueId) chooseQueue(null)
     }
 }

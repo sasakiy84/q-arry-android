@@ -53,11 +53,13 @@ internal data class ArticleMetadata(
     val publishedTime: Long? = null,
 )
 
-class FeedRequestException(message: String, cause: Throwable? = null) : IOException(message, cause)
+class FeedRequestException(message: String, cause: Throwable? = null, val httpStatus: Int? = null) : IOException(message, cause)
 
 class FeedClient(
     private val openConnection: (String) -> HttpURLConnection = { URL(it).openConnection() as HttpURLConnection },
 ) {
+    private val archivePolicies = LinkedHashMap<String, Pair<Long, ArchiveRobots>>()
+
     fun discover(input: String): List<FeedDocument> = discover(input, preview = false).feeds
 
     internal fun discoverForRegistration(input: String): FeedDiscovery = discover(input, preview = true)
@@ -164,6 +166,34 @@ class FeedClient(
         }
     }
 
+    internal fun articleText(url: String): String? {
+        val address = httpsUrl(url) ?: return null
+        val page = fetch(address, archiveArticle = true)
+        return if (page.archiveAllowed) extractArticleText(page.parseHtml()) else null
+    }
+
+    private fun robotsAllowArchive(address: String): Boolean {
+        val uri = URI(address)
+        val origin = "${uri.scheme}://${uri.rawAuthority}"
+        val now = System.currentTimeMillis()
+        val cached = synchronized(archivePolicies) { archivePolicies[origin] }
+        val rules = if (cached != null && cached.first > now) cached.second else {
+            val policy = try {
+                ArchiveRobots.parse(fetch("$origin/robots.txt", robots = true).bytes.toString(Charsets.UTF_8))
+            } catch (error: FeedRequestException) {
+                if (Thread.currentThread().isInterrupted) throw InterruptedException()
+                ArchiveRobots.parse(if (error.httpStatus in setOf(404, 410)) "" else "User-agent: *\nDisallow: /")
+            }
+            synchronized(archivePolicies) {
+                if (archivePolicies.size >= 128) archivePolicies.remove(archivePolicies.keys.first())
+                archivePolicies[origin] = now + 60 * 60 * 1000L to policy
+            }
+            policy
+        }
+        val path = uri.rawPath.ifEmpty { "/" } + (uri.rawQuery?.let { "?$it" } ?: "")
+        return rules.allows(path)
+    }
+
     private fun tryCandidate(url: String): FeedDocument? {
         if (Thread.currentThread().isInterrupted) throw InterruptedException()
         return try {
@@ -185,9 +215,11 @@ class FeedClient(
         etag: String? = null,
         modified: String? = null,
         articleMetadata: Boolean = false,
+        archiveArticle: Boolean = false,
+        robots: Boolean = false,
     ): FeedResponse {
         try {
-            return fetchFollowingRedirects(url, etag, modified, articleMetadata)
+            return fetchFollowingRedirects(url, etag, modified, articleMetadata, archiveArticle, robots)
         } catch (error: FeedRequestException) {
             throw error
         } catch (error: IOException) {
@@ -208,6 +240,8 @@ class FeedClient(
         etag: String?,
         modified: String?,
         articleMetadata: Boolean,
+        archiveArticle: Boolean,
+        robots: Boolean,
     ): FeedResponse {
         var address = url
         var conditional = true
@@ -217,6 +251,7 @@ class FeedClient(
             if (!address.startsWith("https://")) {
                 throw FeedRequestException("サイトに接続するにはHTTPSのURLが必要です。")
             }
+            if (archiveArticle && !robotsAllowArchive(address)) return FeedResponse(address, archiveAllowed = false)
             val connection = openConnection(address)
             try {
                 connection.apply {
@@ -226,7 +261,8 @@ class FeedClient(
                     setRequestProperty("User-Agent", "Q-arry/0.1 (Android feed reader)")
                     setRequestProperty(
                         "Accept",
-                        if (articleMetadata) "text/html, application/xhtml+xml"
+                        if (robots) "text/plain, */*;q=0.1"
+                        else if (articleMetadata || archiveArticle) "text/html, application/xhtml+xml"
                         else "application/rss+xml, application/atom+xml, application/xml, text/xml, text/html, */*;q=0.5",
                     )
                     if (conditional) {
@@ -250,9 +286,24 @@ class FeedClient(
                         return FeedResponse(address, notModified = true)
                     }
                     in 200..299 -> {
-                        val limit = if (articleMetadata) MAX_ARTICLE_METADATA_BYTES else MAX_FEED_BYTES + 1
+                        val contentType = connection.contentType?.substringBefore(';')?.trim()?.lowercase(Locale.ROOT)
+                        if (archiveArticle && contentType != null && contentType !in articleContentTypes) {
+                            return FeedResponse(address, archiveAllowed = false)
+                        }
+                        val noArchive = archiveArticle && connection.headerFields.any { (key, values) ->
+                            key.equals("X-Robots-Tag", true) && values.any { noArchiveDirective.containsMatchIn(it) }
+                        }
+                        if (noArchive) return FeedResponse(address, archiveAllowed = false)
+                        val limit = when {
+                            robots -> 512 * 1024
+                            articleMetadata -> MAX_ARTICLE_METADATA_BYTES
+                            archiveArticle -> MAX_ARCHIVE_PAGE_BYTES + 1
+                            else -> MAX_FEED_BYTES + 1
+                        }
                         val bytes = connection.inputStream.use { it.readNBytes(limit) }
-                        if (bytes.size > MAX_FEED_BYTES) throw FeedRequestException("取得したデータが大きすぎます。")
+                        if (bytes.size > (if (archiveArticle) MAX_ARCHIVE_PAGE_BYTES else MAX_FEED_BYTES)) {
+                            throw FeedRequestException("取得したデータが大きすぎます。")
+                        }
                         val charset = connection.contentType?.let { contentType ->
                             charsetPattern.find(contentType)?.groupValues?.get(1)?.let {
                                 runCatching { Charset.forName(it).name() }.getOrNull()
@@ -266,7 +317,7 @@ class FeedClient(
                             modified = connection.getHeaderField("Last-Modified"),
                         )
                     }
-                    else -> throw FeedRequestException("フィードを取得できませんでした（HTTP $status）。")
+                    else -> throw FeedRequestException("フィードを取得できませんでした（HTTP $status）。", httpStatus = status)
                 }
             } finally {
                 connection.disconnect()
@@ -283,12 +334,16 @@ private data class FeedResponse(
     val etag: String? = null,
     val modified: String? = null,
     val notModified: Boolean = false,
+    val archiveAllowed: Boolean = true,
 ) {
     fun parseHtml(): Document = Jsoup.parse(ByteArrayInputStream(bytes), charset, url)
 }
 
 private const val MAX_FEED_BYTES = 8 * 1024 * 1024
 private const val MAX_ARTICLE_METADATA_BYTES = 128 * 1024
+private const val MAX_ARCHIVE_PAGE_BYTES = 2 * 1024 * 1024
+private val articleContentTypes = setOf("text/html", "application/xhtml+xml")
+private val noArchiveDirective = Regex("""\bnoarchive\b""", RegexOption.IGNORE_CASE)
 private const val MAX_ADVERTISED_FEEDS = 6
 private val articleTitleKeys = listOf("og:title", "twitter:title")
 private val articleDescriptionKeys = listOf("og:description", "twitter:description")
