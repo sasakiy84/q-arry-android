@@ -1,7 +1,51 @@
+import java.net.URI
+import java.security.MessageDigest
+import java.util.HexFormat
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+}
+
+abstract class PrepareQuoteModel : DefaultTask() {
+    @get:OutputDirectory abstract val outputDirectory: DirectoryProperty
+    @get:Input abstract val modelUrl: Property<String>
+    @get:Input abstract val modelSha256: Property<String>
+    @get:Internal abstract val offline: Property<Boolean>
+
+    @TaskAction
+    fun prepare() {
+        val model = outputDirectory.file("quote/model.onnx").get().asFile
+        val expectedBytes = 26_400_965
+        fun matches(bytes: ByteArray): Boolean =
+            bytes.size == expectedBytes &&
+                HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes)) == modelSha256.get()
+
+        if (model.isFile && model.length() == expectedBytes.toLong() && matches(model.readBytes())) return
+        check(!offline.get()) { "The verified quote model is not cached. Run :app:prepareQuoteModel once online." }
+        val connection = URI(modelUrl.get()).toURL().openConnection().apply {
+            connectTimeout = 15_000
+            readTimeout = 40_000
+        }
+        val bytes = connection.getInputStream().use { it.readNBytes(expectedBytes + 1) }
+        check(matches(bytes)) { "The downloaded quote model failed SHA-256 verification." }
+        model.parentFile.mkdirs()
+        model.writeBytes(bytes)
+    }
+}
+
+val prepareQuoteModel by tasks.registering(PrepareQuoteModel::class) {
+    outputDirectory.set(layout.buildDirectory.dir("generated/quoteAssets"))
+    modelUrl.set(
+        "https://huggingface.co/hotchpotch/bekko-static-embedding-v1/resolve/c18167b8f244c1bc6de21ce9b710bac8a29c4615/onnx/model_int8_dim128.onnx",
+    )
+    modelSha256.set("b848886b593c3b00e99815482ac1e963f93f194ed087390c2ee769d14206e1ab")
+    offline.set(gradle.startParameter.isOffline)
+}
+
+androidComponents.onVariants { variant ->
+    variant.sources.assets?.addGeneratedSourceDirectory(prepareQuoteModel, PrepareQuoteModel::outputDirectory)
 }
 
 val robolectricSdk by configurations.creating {
@@ -45,6 +89,7 @@ android {
     }
 
     buildFeatures { compose = true }
+    androidResources { noCompress += "onnx" }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

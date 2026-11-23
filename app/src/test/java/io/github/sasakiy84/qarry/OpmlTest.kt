@@ -35,7 +35,7 @@ class OpmlTest {
         val input = """
             <opml version="2.0"><body>
               <outline text="First" xmlUrl="HTTPS://Example.com:443/feed#latest"/>
-              <outline text="Second" xmlUrl="https://example.com/feed"/>
+              <outline text="Second" xmlurl="https://example.com/feed"/>
               <outline text="Plain HTTP" xmlUrl="http://example.com/feed"/>
               <outline text="Invalid" xmlUrl="/feed"/>
               <outline text="Web page" htmlUrl="https://example.com/"/>
@@ -56,19 +56,28 @@ class OpmlTest {
 
     @Test
     fun exportedOpmlIsValidXmlAndPreservesJapaneseNamesUrlsAndWebsiteScopes() {
+        val queueRule = KeywordFilter(KeywordFilterMode.Exclude, listOf("広告", "A & B"))
         val subscriptions = listOf(
-            OpmlFeed("https://example.com/feed?id=1&lang=ja", "研究 & ニュース <新着> \"RSS\"", "https://example.com/"),
+            OpmlFeed(
+                "https://example.com/feed?id=1&lang=ja", "研究 & ニュース <新着> \"RSS\"", "https://example.com/",
+                isFavorite = true, queueFilters = linkedMapOf("研究" to queueRule, "資料/確認, A & B" to null),
+            ),
             OpmlFeed(
                 "https://example.com/news", "Webページの監視", "https://example.com/news", "main article",
                 encodeWebsiteWatch(WebsiteWatch(null, null, true, setOf("example.com/news/"), setOf("sample"))),
             ),
             OpmlFeed("https://example.com/old", "旧バージョンで登録したWebページ", "https://example.com/old", "main > article:nth-child(2)"),
         )
-        val bytes = encodeOpml(subscriptions)
-        val xml = DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(bytes.inputStream())
+        val queues = listOf("研究", "資料/確認, A & B", "空のキュー")
+        val bytes = encodeOpml(subscriptions, queues)
+        val xml = DocumentBuilderFactory.newInstance().apply { isNamespaceAware = true }.newDocumentBuilder().parse(bytes.inputStream())
         assertEquals("opml", xml.documentElement.tagName)
         assertEquals("2.0", xml.documentElement.getAttribute("version"))
-        assertEquals(subscriptions, readOpml(bytes.inputStream()).feeds)
+        val rss = xml.getElementsByTagName("outline").item(0).attributes
+        assertEquals("/研究", rss.getNamedItem("category").nodeValue)
+        assertEquals("https://example.com/feed?id=1&lang=ja", rss.getNamedItem("xmlUrl").nodeValue)
+        assertEquals("https://example.com/", rss.getNamedItem("htmlUrl").nodeValue)
+        assertEquals(OpmlContents(subscriptions, 0, 0, queues), readOpml(bytes.inputStream()))
         assertEquals(OpmlContents(emptyList(), 0, 0), readOpml(encodeOpml(emptyList()).inputStream()))
     }
 

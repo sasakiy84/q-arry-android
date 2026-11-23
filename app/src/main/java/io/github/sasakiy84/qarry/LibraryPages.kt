@@ -190,7 +190,7 @@ internal fun QueueArticlesPage(
 }
 
 @Composable
-fun ArticlePage(
+internal fun ArticlePage(
     article: Article,
     onFeed: () -> Unit,
     onRemove: () -> Unit,
@@ -201,6 +201,7 @@ fun ArticlePage(
     modifier: Modifier = Modifier,
     onFetchFullText: (() -> Unit)? = null,
     fetchingFullText: Boolean = false,
+    quoteLearning: QuoteLearning? = null,
 ) {
     val metadata = rememberArticleMetadata(article.url)
     val image = rememberArticleImage(metadata?.imageUrl, article.thumbnailUrl)
@@ -225,6 +226,13 @@ fun ArticlePage(
             article.timestampLabel(metadata)?.let { date ->
                 Spacer(Modifier.height(8.dp))
                 Text(date, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            val body = article.archivedBody
+            if (quoteLearning != null && body != null) {
+                ArticleLeadQuote(
+                    quoteLearning, QuoteSource(article.id, title, body),
+                    Modifier.padding(top = 12.dp),
+                )
             }
             articleUrl?.let { url ->
                 Spacer(Modifier.height(12.dp))

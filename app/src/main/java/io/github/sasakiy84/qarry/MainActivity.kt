@@ -1,5 +1,6 @@
 package io.github.sasakiy84.qarry
 
+import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -12,8 +13,11 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.graphics.Color
 
 class MainActivity : ComponentActivity() {
+    private var notificationFeedId by mutableStateOf<Long?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (savedInstanceState == null) notificationFeedId = intent?.notifiedFeedId()
         enableEdgeToEdge()
         window.isNavigationBarContrastEnforced = false
         setContent {
@@ -22,13 +26,22 @@ class MainActivity : ComponentActivity() {
                 val preference = remember { ArticleOpeningPreference(this@MainActivity) }
                 var mode by remember { mutableStateOf(preference.mode) }
                 CompositionLocalProvider(LocalArticleOpenMode provides mode) {
-                    QarryScreen(feedLibrary()) { updated ->
+                    QarryScreen(
+                        feedLibrary(),
+                        notificationFeedId = notificationFeedId,
+                        onNotificationOpened = { notificationFeedId = null },
+                    ) { updated ->
                         preference.mode = updated
                         mode = updated
                     }
                 }
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        intent.notifiedFeedId()?.let { notificationFeedId = it }
     }
 }
 

@@ -6,6 +6,9 @@ import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import android.database.sqlite.SQLiteException
+import android.util.JsonWriter
+import java.io.Writer
+import java.time.Instant
 import java.util.PriorityQueue
 
 data class Subscription(
@@ -24,6 +27,7 @@ data class Subscription(
     val keywordFilter: KeywordFilter? = null,
     val queueKeywordFilters: Map<Long, KeywordFilter> = emptyMap(),
     val htmlWatch: String? = null,
+    val notifications: FeedNotificationMode = FeedNotificationMode.Default,
 )
 
 enum class ArticleRating(val value: Int, val label: String) {
@@ -85,7 +89,7 @@ data class LibrarySnapshot(
     val hasUnread: Boolean = articles.any { !it.read },
 )
 
-class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null, 10) {
+class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null, 12) {
     override fun onConfigure(db: SQLiteDatabase): Unit = db.setForeignKeyConstraintsEnabled(true)
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -102,7 +106,8 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
                 html_item_selector TEXT,
                 home_url TEXT,
                 is_favorite INTEGER NOT NULL DEFAULT 0,
-                html_watch TEXT
+                html_watch TEXT,
+                notifications INTEGER NOT NULL DEFAULT 0
             )
             """.trimIndent(),
         )
@@ -146,10 +151,11 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
         createArticleActions(db)
         createKeywordFilters(db)
         createArticleSearch(db)
+        createQuoteTables(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        check(oldVersion in 1..9 && newVersion == 10) { "No database migration from $oldVersion to $newVersion" }
+        check(oldVersion in 1..11 && newVersion == 12) { "No database migration from $oldVersion to $newVersion" }
         if (oldVersion == 1) {
             db.execSQL("ALTER TABLE feed ADD COLUMN html_item_selector TEXT")
             db.execSQL("ALTER TABLE article ADD COLUMN thumbnail_url TEXT")
@@ -175,7 +181,9 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
             db.execSQL("ALTER TABLE article ADD COLUMN original_opened_at INTEGER")
             createArticleActions(db)
         }
-        createArticleSearch(db)
+        if (oldVersion < 10) createArticleSearch(db)
+        if (oldVersion < 11) db.execSQL("ALTER TABLE feed ADD COLUMN notifications INTEGER NOT NULL DEFAULT 0")
+        createQuoteTables(db)
     }
 
     private fun createArticleSearch(db: SQLiteDatabase) {
@@ -293,27 +301,47 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
         readableDatabase.articleListing("a.viewed_at IS NOT NULL", emptyList(), limit, "a.viewed_at DESC, a.id DESC")
 
     internal fun ratingHistory(limit: Int): RatingListing {
-        val articles = readableDatabase.rawQuery(
-            """
+        val articles = readableDatabase.queryRatings(limit + 1).use { cursor -> cursor.rows { readRatedArticle() } }
+        return RatingListing(articles.take(limit), articles.size > limit)
+    }
+
+    internal fun writeRatingHistory(output: Writer): Int = readableDatabase.transaction {
+        val json = JsonWriter(output)
+        var count = 0
+        json.beginArray()
+        queryRatings().use { cursor ->
+            while (cursor.moveToNext()) {
+                if (Thread.currentThread().isInterrupted) throw InterruptedException()
+                val entry = cursor.readRatedArticle()
+                json.beginObject()
+                json.name("feedUrl").value(entry.key.feedUrl)
+                json.name("entryKey").value(entry.key.entryKey)
+                json.name("feedTitle").value(entry.feedTitle)
+                json.name("articleUrl").value(entry.url)
+                json.name("title").value(entry.title)
+                json.name("rating").value(entry.rating.name)
+                json.name("ratedAt").value(Instant.ofEpochMilli(entry.ratedAt).toString())
+                json.endObject()
+                count++
+            }
+        }
+        json.endArray()
+        json.flush()
+        count
+    }
+
+    private fun SQLiteDatabase.queryRatings(limit: Int? = null): Cursor = rawQuery(
+        """
             SELECT r.feed_url, r.entry_key, a.id, COALESCE(f.title, r.feed_url),
                    COALESCE(NULLIF(a.title, ''), NULLIF(r.title, ''), a.url, r.article_url, '無題の記事'),
                    COALESCE(a.url, r.article_url), a.thumbnail_url, r.rating, r.rated_at
             FROM article_feedback r
             LEFT JOIN feed f ON f.url = r.feed_url
             LEFT JOIN article a ON a.feed_id = f.id AND a.entry_key = r.entry_key
-            ORDER BY r.rated_at DESC, r.rowid DESC LIMIT ?
-            """.trimIndent(),
-            arrayOf((limit + 1).toString()),
-        ).use { cursor ->
-            cursor.rows {
-                RatedArticle(
-                    RatingKey(getString(0), getString(1)), nullableLong(2), getString(3), getString(4),
-                    getString(5), getString(6), ArticleRating.entries.first { it.value == getInt(7) }, getLong(8),
-                )
-            }
-        }
-        return RatingListing(articles.take(limit), articles.size > limit)
-    }
+            ORDER BY r.rated_at DESC, r.rowid DESC
+        """.trimIndent() + if (limit != null) " LIMIT ?" else "",
+        limit?.let { arrayOf(it.toString()) },
+    )
 
     fun article(id: Long): Article? = readableDatabase.rawQuery(
         "${articleQuery("a.body", "(SELECT body FROM article_archive WHERE article_id = a.id)")} WHERE a.id = ?",
@@ -485,7 +513,7 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
             SELECT f.id, f.url, f.title, f.etag, f.modified, f.refreshed_at, f.error, f.html_item_selector,
                    f.home_url, f.is_favorite,
                    (SELECT COALESCE(a.published, a.discovered) FROM article a WHERE a.feed_id = f.id
-                    ORDER BY COALESCE(a.published, a.discovered) DESC LIMIT 1), f.html_watch
+                    ORDER BY COALESCE(a.published, a.discovered) DESC LIMIT 1), f.html_watch, f.notifications
             FROM feed f ORDER BY f.title COLLATE NOCASE
             """.trimIndent(),
             null,
@@ -511,6 +539,7 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
                     keywordFilter = filters[null],
                     queueKeywordFilters = filters.mapNotNull { (queueId, rule) -> queueId?.let { it to rule } }.toMap(),
                     htmlWatch = getString(11),
+                    notifications = FeedNotificationMode.fromValue(getInt(12)),
                 )
             }
         }
@@ -531,10 +560,53 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
         id
     }
 
-    internal fun importSubscriptions(feeds: List<OpmlFeed>): Set<Long> = writableDatabase.transaction {
-        feeds.mapNotNull { feed ->
-            insertFeed(feed.url, feed.title, feed.homeUrl, feed.htmlItemSelector, feed.htmlWatch).takeIf { it != -1L }
+    internal fun opmlSubscriptions(): OpmlContents = readableDatabase.transaction {
+        val queues = rawQuery("SELECT id, name FROM queue ORDER BY id", null).use { cursor ->
+            cursor.rows { getLong(0) to getString(1) }.toMap()
+        }
+        val feeds = subscriptions(this).map { feed ->
+            OpmlFeed(
+                feed.url, feed.title, feed.homeUrl, feed.htmlItemSelector, feed.htmlWatch, feed.isFavorite, feed.keywordFilter,
+                feed.queueIds.mapNotNull { id -> queues[id]?.let { it to feed.queueKeywordFilters[id] } }.toMap(),
+                feed.notifications,
+            )
+        }
+        OpmlContents(feeds, 0, 0, queues.values.toList())
+    }
+
+    internal fun importSubscriptions(contents: OpmlContents): FeedImportResult = writableDatabase.transaction {
+        val queueIds = mutableMapOf<String, Long>()
+        var createdQueues = 0
+        fun queueId(name: String): Long = queueIds.getOrPut(name) {
+            val inserted = insertWithOnConflict(
+                "queue", null, ContentValues().apply { put("name", name) }, SQLiteDatabase.CONFLICT_IGNORE,
+            )
+            if (inserted != -1L) {
+                createdQueues++
+                inserted
+            } else {
+                rawQuery("SELECT id FROM queue WHERE name = ?", arrayOf(name)).use {
+                    check(it.moveToFirst())
+                    it.getLong(0)
+                }
+            }
+        }
+        contents.queues.forEach { queueId(it) }
+        val feeds = contents.feeds.mapNotNull { feed ->
+            val id = insertFeed(
+                feed.url, feed.title, feed.homeUrl, feed.htmlItemSelector, feed.htmlWatch, feed.isFavorite, feed.notifications,
+            )
+            if (id == -1L) return@mapNotNull null
+            val membership = feed.queueFilters.entries.associate { (name, rule) -> queueId(name) to rule }
+            membership.keys.forEach { addMembership(id, it) }
+            if (feed.keywordFilter != null) {
+                insertKeywordFilter(id, null, feed.keywordFilter)
+            } else {
+                membership.forEach { (queueId, rule) -> if (rule != null) insertKeywordFilter(id, queueId, rule) }
+            }
+            id
         }.toSet()
+        FeedImportResult(feeds, contents.duplicateCount, contents.unsupportedCount, createdQueues)
     }
 
     private fun SQLiteDatabase.insertFeed(
@@ -543,6 +615,8 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
         homeUrl: String? = null,
         htmlItemSelector: String? = null,
         htmlWatch: String? = null,
+        isFavorite: Boolean = false,
+        notifications: FeedNotificationMode = FeedNotificationMode.Default,
     ): Long {
         val values = ContentValues().apply {
             put("url", url)
@@ -550,33 +624,66 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
             put("home_url", homeUrl)
             put("html_item_selector", htmlItemSelector)
             put("html_watch", htmlWatch)
+            put("is_favorite", if (isFavorite) 1 else 0)
+            put("notifications", notifications.value)
         }
         return insertWithOnConflict("feed", null, values, SQLiteDatabase.CONFLICT_IGNORE)
     }
 
-    fun recordRefresh(
+    internal fun recordRefresh(
         feedId: Long,
         document: FeedDocument?,
         expected: Subscription? = null,
         error: String? = null,
-    ): Boolean = writableDatabase.transaction {
+        notificationDefault: Boolean? = null,
+    ): FeedRefreshResult = writableDatabase.transaction {
         // A preview can be saved while an older refresh is still fetching the page.
-        if (expected != null && !rawQuery(
-                "SELECT etag, modified, html_item_selector, html_watch, refreshed_at FROM feed WHERE id = ?",
-                arrayOf(feedId.toString()),
-            ).use { cursor ->
-                cursor.moveToFirst() && cursor.getString(0) == expected.etag && cursor.getString(1) == expected.modified &&
-                    cursor.getString(2) == expected.htmlItemSelector && cursor.getString(3) == expected.htmlWatch &&
-                    cursor.nullableLong(4) == expected.refreshedAt
+        val canNotify = rawQuery(
+            "SELECT etag, modified, html_item_selector, html_watch, refreshed_at, notifications FROM feed WHERE id = ?",
+            arrayOf(feedId.toString()),
+        ).use { cursor ->
+            if (!cursor.moveToFirst()) return@transaction FeedRefreshResult(false)
+            val refreshedAt = cursor.nullableLong(4)
+            if (expected != null && (
+                    cursor.getString(0) != expected.etag || cursor.getString(1) != expected.modified ||
+                        cursor.getString(2) != expected.htmlItemSelector || cursor.getString(3) != expected.htmlWatch ||
+                        refreshedAt != expected.refreshedAt
+                )
+            ) return@transaction FeedRefreshResult(false)
+            notificationDefault != null && refreshedAt != null && FeedNotificationMode.fromValue(cursor.getInt(5))
+                .enabled(notificationDefault)
+        }
+        // New rows have IDs above this boundary, even if their publication dates are older.
+        val previousArticleId = if (canNotify && document != null && error == null && document.articles.isNotEmpty()) {
+            rawQuery("SELECT COALESCE(MAX(id), 0) FROM article", null).use {
+                check(it.moveToFirst())
+                it.getLong(0)
             }
-        ) return@transaction false
+        } else null
         val now = System.currentTimeMillis()
         when {
             error != null -> execSQL("UPDATE feed SET error = ? WHERE id = ?", arrayOf<Any>(error, feedId))
             document != null -> saveDocument(feedId, document, now)
             else -> execSQL("UPDATE feed SET refreshed_at = ?, error = NULL WHERE id = ?", arrayOf(now, feedId))
         }
-        true
+        val newArticles = previousArticleId?.let { newFeedArticles(feedId, it) }
+        FeedRefreshResult(true, newArticles)
+    }
+
+    internal fun setFeedNotifications(feedId: Long, mode: FeedNotificationMode): Unit {
+        writableDatabase.execSQL("UPDATE feed SET notifications = ? WHERE id = ?", arrayOf<Any>(mode.value, feedId))
+    }
+
+    private fun SQLiteDatabase.newFeedArticles(feedId: Long, afterId: Long): NewFeedArticles? = rawQuery(
+        """
+        SELECT f.title, COALESCE(NULLIF(a.title, ''), a.url, '無題の記事'), COUNT(*) OVER()
+        $ARTICLE_FROM
+        WHERE a.id > ? AND a.feed_id = ? AND $ACTIVE_ARTICLE AND ${keywordFilterCondition(forQueue = false)}
+        ORDER BY COALESCE(a.published, a.discovered) DESC, a.id DESC LIMIT 1
+        """.trimIndent(),
+        arrayOf(afterId.toString(), feedId.toString()),
+    ).use { cursor ->
+        if (cursor.moveToFirst()) NewFeedArticles(feedId, cursor.getString(0), cursor.getString(1), cursor.getInt(2)) else null
     }
 
     internal fun recentWebsiteKeys(feedId: Long): Set<String> = readableDatabase.rawQuery(
@@ -808,6 +915,12 @@ private inline fun <T> Cursor.rows(readRow: Cursor.() -> T): List<T> =
 
 private fun Cursor.nullableLong(column: Int): Long? = if (isNull(column)) null else getLong(column)
 
+private fun Cursor.readRatedArticle(): RatedArticle =
+    RatedArticle(
+        RatingKey(getString(0), getString(1)), nullableLong(2), getString(3), getString(4),
+        getString(5), getString(6), ArticleRating.entries.first { it.value == getInt(7) }, getLong(8),
+    )
+
 private fun Cursor.readArticle(): Article =
     Article(
         id = getLong(0), feedTitle = getString(1), title = getString(2), url = getString(3),
@@ -866,7 +979,7 @@ private fun articleQuery(body: String, archivedBody: String = "NULL"): String = 
     $ARTICLE_FROM
 """.trimIndent()
 
-private inline fun <T> SQLiteDatabase.transaction(block: SQLiteDatabase.() -> T): T {
+internal inline fun <T> SQLiteDatabase.transaction(block: SQLiteDatabase.() -> T): T {
     beginTransactionNonExclusive()
     return try {
         block().also { setTransactionSuccessful() }

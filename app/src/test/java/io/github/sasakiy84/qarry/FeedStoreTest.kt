@@ -3,6 +3,7 @@ package io.github.sasakiy84.qarry
 import android.app.Application
 import android.database.sqlite.SQLiteDatabase
 import kotlinx.coroutines.runBlocking
+import org.json.JSONArray
 import org.junit.After
 import org.junit.Assert.*
 import org.junit.Before
@@ -13,6 +14,7 @@ import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.SQLiteMode
 import java.io.ByteArrayOutputStream
+import java.time.Instant
 import java.util.Locale
 
 @RunWith(RobolectricTestRunner::class)
@@ -102,27 +104,93 @@ class FeedStoreTest {
     @Test
     fun exportingAndImportingRestoresRssAndWebsiteSubscriptionsIncludingTheSavedSelector() = runBlocking {
         val rssId = store.subscribe(example, null)
+        store.queueName(null, "研究")
+        store.queueName(null, "資料/確認, A & B")
+        store.queueName(null, "空のキュー")
+        val queues = store.load(null, false, 10).queues
+        val (research, materials) = queues
+        val feedFilter = KeywordFilter(KeywordFilterMode.Include, listOf("論文", "調査"))
+        val queueFilter = KeywordFilter(KeywordFilterMode.Exclude, listOf("広告"))
+        store.setMembership(rssId, setOf(research.id, materials.id))
+        store.setFeedFavorite(rssId, true)
+        store.setFeedNotifications(rssId, FeedNotificationMode.On)
+        store.setFeedKeywordFilter(rssId, feedFilter)
+        val article = store.feedArticles(rssId, 10, applyKeywordFilter = false).articles.single()
+        val archivedBody = "エクスポート対象外の保存済み本文"
+        store.saveArchive(ArchiveCandidate(article.id, checkNotNull(article.url)), archivedBody, Long.MAX_VALUE)
         val site = example.copy(
             url = "https://publisher.example/news/",
             title = "更新のお知らせ",
             home = "https://publisher.example/news/",
             htmlItemSelector = "#news > article:nth-child(2)",
+            htmlWatch = encodeWebsiteWatch(WebsiteWatch(null, null, false, setOf("publisher.example/news/"), setOf("entry"))),
         )
         val siteId = store.subscribe(site, null)
+        store.setFeedNotifications(siteId, FeedNotificationMode.Off)
+        store.setMembership(siteId, setOf(research.id), mapOf(research.id to queueFilter))
         val library = FeedLibrary(store, FeedClient { error("OPML file operations don't require a network connection") })
         val output = ByteArrayOutputStream()
         assertEquals(2, library.exportOpml { output })
+        assertFalse(archivedBody in output.toString(Charsets.UTF_8))
+        assertFalse("First article" in output.toString(Charsets.UTF_8))
 
         store.removeFeed(rssId)
         store.removeFeed(siteId)
+        queues.forEach { store.removeQueue(it.id) }
         val imported = library.importOpml { output.toByteArray().inputStream() }
         assertEquals(2, imported.feedIds.size)
         assertEquals(0, imported.unsupportedCount)
+        assertEquals(3, imported.createdQueues)
         val restored = store.subscriptions().associateBy { it.url }
+        val restoredQueues = store.load(null, false, 10).queues.associate { it.name to it.id }
+        assertEquals(queues.map { it.name }, restoredQueues.keys.toList())
+        val researchId = restoredQueues.getValue(research.name)
         assertNull(restored.getValue(example.url).htmlItemSelector)
         assertEquals(example.home, restored.getValue(example.url).homeUrl)
+        assertTrue(restored.getValue(example.url).isFavorite)
+        assertEquals(FeedNotificationMode.On, restored.getValue(example.url).notifications)
+        assertEquals(feedFilter, restored.getValue(example.url).keywordFilter)
+        assertEquals(setOf(researchId, restoredQueues.getValue(materials.name)), restored.getValue(example.url).queueIds)
         assertEquals(site.title, restored.getValue(site.url).title)
         assertEquals(site.htmlItemSelector, restored.getValue(site.url).htmlItemSelector)
+        assertEquals(site.htmlWatch, restored.getValue(site.url).htmlWatch)
+        assertEquals(FeedNotificationMode.Off, restored.getValue(site.url).notifications)
+        assertEquals(mapOf(researchId to queueFilter), restored.getValue(site.url).queueKeywordFilters)
+
+        store.setFeedFavorite(restored.getValue(example.url).id, false)
+        assertEquals(FeedImportResult(emptySet(), 2, 0), library.importOpml { output.toByteArray().inputStream() })
+        assertFalse(store.subscriptions().first { it.url == example.url }.isFavorite)
+    }
+
+    @Test
+    fun exportsEveryCurrentRatingIncludingUnsubscribedArticlesWithoutBodyText() = runBlocking {
+        val document = example.copy(articles = listOf(
+            FeedArticle("entry-1", "研究の「見どころ」", "https://publisher.example/first", "出力しない本文", 1000L),
+            FeedArticle("entry-2", "次の記事", null, "出力しない本文", 2000L),
+        ))
+        val feed = store.subscribe(document, null)
+        val articles = store.feedArticles(feed, 10).articles.associateBy { it.url }
+        store.dismissArticle(articles.getValue("https://publisher.example/first").id, ArticleRating.Good)
+        store.dismissArticle(articles.getValue(null).id, ArticleRating.Bad)
+        val first = store.ratingHistory(10).articles.single { it.key.entryKey == "entry-1" }
+        store.changeRating(first.key, ArticleRating.Bad)
+        store.removeFeed(feed)
+        assertTrue(store.ratingHistory(1).hasMore)
+
+        val output = ByteArrayOutputStream()
+        val library = FeedLibrary(store, FeedClient { error("Export should be offline") })
+        assertEquals(2, library.exportRatingHistory { output })
+        val json = output.toString(Charsets.UTF_8)
+        val ratings = JSONArray(json)
+        assertEquals(2, ratings.length())
+        assertFalse("出力しない本文" in json)
+        val sameEntry = (0 until ratings.length()).map(ratings::getJSONObject).single { it.getString("entryKey") == "entry-1" }
+        assertEquals("研究の「見どころ」", sameEntry.getString("title"))
+        assertEquals(example.url, sameEntry.getString("feedUrl"))
+        assertEquals("https://publisher.example/first", sameEntry.getString("articleUrl"))
+        assertEquals("Bad", sameEntry.getString("rating"))
+        assertEquals(first.ratedAt, Instant.parse(sameEntry.getString("ratedAt")).toEpochMilli())
+        assertTrue((0 until ratings.length()).map(ratings::getJSONObject).single { it.getString("entryKey") == "entry-2" }.isNull("articleUrl"))
     }
 
     @Test
@@ -594,11 +662,11 @@ class FeedStoreTest {
             htmlWatch = encodeWebsiteWatch(WebsiteWatch(null, null, false, setOf("publisher.example/news/"), emptySet())),
             articles = listOf(FeedArticle("second", "Second article", "https://publisher.example/news/2", null, 2000L)),
         )
-        assertTrue(store.recordRefresh(feedId, null, expected = migrated, error = WEBSITE_SCOPE_CHANGED))
+        assertTrue(store.recordRefresh(feedId, null, expected = migrated, error = WEBSITE_SCOPE_CHANGED).applied)
         assertEquals(WEBSITE_SCOPE_CHANGED, store.subscriptions().single().error)
         assertTrue(store.updateWebsiteScope(feedId, choice))
-        assertFalse(store.recordRefresh(feedId, website, expected = migrated))
-        assertFalse(store.recordRefresh(feedId, null, expected = migrated, error = WEBSITE_SCOPE_CHANGED))
+        assertFalse(store.recordRefresh(feedId, website, expected = migrated).applied)
+        assertFalse(store.recordRefresh(feedId, null, expected = migrated, error = WEBSITE_SCOPE_CHANGED).applied)
         val updated = store.subscriptions().single()
         assertEquals(choice.htmlItemSelector, updated.htmlItemSelector)
         assertEquals(choice.htmlWatch, updated.htmlWatch)
@@ -673,14 +741,50 @@ class FeedStoreTest {
         store.readableDatabase.rawQuery("SELECT 1 FROM article_action", null).use { assertFalse(it.moveToFirst()) }
     }
 
+    @Test
+    fun upgradingVersionTenKeepsArchivedArticlesAndUsesTheNotificationDefault() {
+        val feed = store.subscribe(example, null)
+        val article = store.feedArticles(feed, 10).articles.single()
+        store.saveArchive(ArchiveCandidate(article.id, checkNotNull(article.url)), "保存済みの本文", Long.MAX_VALUE)
+        reopenFromVersion(10)
+        assertEquals(FeedNotificationMode.Default, store.subscriptions().single().notifications)
+        assertEquals("保存済みの本文", store.article(article.id)?.archivedBody)
+    }
+
+    @Test
+    fun collectsOnlyNewVisibleArticlesAfterTheInitialRefresh() {
+        val feedId = store.importSubscriptions(OpmlContents(listOf(
+            OpmlFeed(example.url, example.title, notifications = FeedNotificationMode.On),
+        ), 0, 0)).feedIds.single()
+        assertNull(store.recordRefresh(feedId, example, notificationDefault = false).newArticles)
+        store.setFeedKeywordFilter(feedId, KeywordFilter(KeywordFilterMode.Exclude, listOf("広告")))
+        val updated = example.copy(articles = listOf(
+            example.articles.single().copy(title = "修正した記事"),
+            FeedArticle("newer", "新着記事", null, null, 800L),
+            FeedArticle("older", "初めて取得した過去の記事", null, null, 700L),
+            FeedArticle("ad", "広告", null, null, 3000L),
+        ))
+        assertEquals(
+            NewFeedArticles(feedId, example.title, "新着記事", 2),
+            store.recordRefresh(feedId, updated, notificationDefault = false).newArticles,
+        )
+        assertNull(store.recordRefresh(feedId, updated, notificationDefault = false).newArticles)
+        assertNull(store.recordRefresh(feedId, null, notificationDefault = false).newArticles)
+    }
+
     private fun reopenFromVersion(version: Int, removeNewerSchema: SQLiteDatabase.() -> Unit = {}) {
         store.writableDatabase.apply {
-            execSQL("DROP TRIGGER article_search_update")
-            execSQL("DROP TRIGGER article_search_delete")
-            execSQL("DROP TABLE article_vector")
-            execSQL("DROP TABLE article_fts")
-            execSQL("DROP TABLE article_archive")
-            execSQL("DROP TABLE search_options")
+            execSQL("DROP TABLE quote_feedback")
+            execSQL("DROP TABLE quote_model")
+            if (version < 11) execSQL("ALTER TABLE feed DROP COLUMN notifications")
+            if (version < 10) {
+                execSQL("DROP TRIGGER article_search_update")
+                execSQL("DROP TRIGGER article_search_delete")
+                execSQL("DROP TABLE article_vector")
+                execSQL("DROP TABLE article_fts")
+                execSQL("DROP TABLE article_archive")
+                execSQL("DROP TABLE search_options")
+            }
             if (version < 9) {
                 execSQL("DROP TABLE article_action")
                 execSQL("ALTER TABLE article DROP COLUMN original_opened_at")

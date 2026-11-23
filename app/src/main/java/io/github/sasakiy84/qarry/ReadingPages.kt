@@ -44,10 +44,11 @@ internal fun SettingsPage(
     onTab: (SettingsTab) -> Unit,
     articleOpenMode: ArticleOpenMode,
     onArticleOpenMode: (ArticleOpenMode) -> Unit,
-    transfer: OpmlTransfer?,
-    choosingFile: Boolean,
-    onImport: () -> Unit,
-    onExport: () -> Unit,
+    notificationSettings: NotificationSettings,
+    quoteEnabled: Boolean,
+    onQuoteEnabled: (Boolean) -> Unit,
+    onQuoteTraining: () -> Unit,
+    transfer: LibraryTransferActions,
     archive: ArticleArchive,
     libraryRevision: Int,
     viewed: ArticleListing?,
@@ -70,7 +71,11 @@ internal fun SettingsPage(
             SettingsTab.General -> Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
                 ArticleOpeningSettings(articleOpenMode, onArticleOpenMode)
                 HorizontalDivider(Modifier.padding(horizontal = 20.dp))
-                FeedTransferSettings(transfer, choosingFile, onImport, onExport)
+                DefaultNotificationSettings(notificationSettings)
+                HorizontalDivider(Modifier.padding(horizontal = 20.dp))
+                FeedTransferSettings(transfer)
+                HorizontalDivider(Modifier.padding(horizontal = 20.dp))
+                QuoteSettings(quoteEnabled, onQuoteEnabled, onQuoteTraining)
                 HorizontalDivider(Modifier.padding(horizontal = 20.dp))
                 ArticleSearchSettings(archive, libraryRevision)
             }
@@ -82,15 +87,24 @@ internal fun SettingsPage(
                     if (viewed.hasMore) moreArticles(onMore)
                 }
             }
-            SettingsTab.Rated -> when {
-                rated == null -> LoadingIndicator("評価履歴を読み込み中")
-                rated.articles.isEmpty() -> EmptyState("評価履歴はありません", null)
-                else -> LazyColumn(contentPadding = PaddingValues(bottom = 24.dp)) {
-                    items(rated.articles, key = { "${it.key.feedUrl}\n${it.key.entryKey}" }) { entry ->
-                        RatingHistoryRow(entry, { onRatedArticle(entry, it) }, { onChangeRating(entry.key, it) })
-                        HorizontalDivider(Modifier.padding(horizontal = 20.dp))
+            SettingsTab.Rated -> Column {
+                TextButton(
+                    onClick = transfer.onExportRatings,
+                    modifier = Modifier.align(Alignment.End).padding(horizontal = 12.dp),
+                    enabled = rated != null && transfer.transfer == null && !transfer.choosingFile,
+                ) {
+                    Text(if (transfer.transfer == LibraryTransfer.ExportingRatings) "保存中" else "エクスポート（JSON）")
+                }
+                when {
+                    rated == null -> LoadingIndicator("評価履歴を読み込み中")
+                    rated.articles.isEmpty() -> EmptyState("評価履歴はありません", null)
+                    else -> LazyColumn(contentPadding = PaddingValues(bottom = 24.dp)) {
+                        items(rated.articles, key = { "${it.key.feedUrl}\n${it.key.entryKey}" }) { entry ->
+                            RatingHistoryRow(entry, { onRatedArticle(entry, it) }, { onChangeRating(entry.key, it) })
+                            HorizontalDivider(Modifier.padding(horizontal = 20.dp))
+                        }
+                        if (rated.hasMore) moreArticles(onMore)
                     }
-                    if (rated.hasMore) moreArticles(onMore)
                 }
             }
         }
@@ -124,21 +138,19 @@ private fun ArticleOpeningSettings(mode: ArticleOpenMode, onChange: (ArticleOpen
 }
 
 @Composable
-private fun FeedTransferSettings(
-    transfer: OpmlTransfer?, choosingFile: Boolean, onImport: () -> Unit, onExport: () -> Unit,
-) {
-    val enabled = transfer == null && !choosingFile
+private fun FeedTransferSettings(actions: LibraryTransferActions) {
+    val enabled = actions.transfer == null && !actions.choosingFile
     Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text("フィードの移行（OPML）", Modifier.semantics { heading() }, style = MaterialTheme.typography.titleMedium)
         FlowRow(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
-            OutlinedButton(onImport, enabled = enabled) {
-                Text(if (transfer == OpmlTransfer.Importing) "読込中" else "インポート")
+            OutlinedButton(actions.onImport, enabled = enabled) {
+                Text(if (actions.transfer == LibraryTransfer.ImportingFeeds) "読込中" else "インポート")
             }
-            OutlinedButton(onExport, enabled = enabled) {
-                Text(if (transfer == OpmlTransfer.Exporting) "保存中" else "エクスポート")
+            OutlinedButton(actions.onExport, enabled = enabled) {
+                Text(if (actions.transfer == LibraryTransfer.ExportingFeeds) "保存中" else "エクスポート")
             }
         }
     }
@@ -190,6 +202,8 @@ internal fun FeedDetailPage(
     onManage: () -> Unit,
     onKeywordFilter: () -> Unit,
     onFavoriteChange: (Boolean) -> Unit,
+    notificationSettings: NotificationSettings,
+    onNotificationModeChange: (FeedNotificationMode) -> Unit,
     onRefresh: () -> Unit,
     onChangeWebsiteScope: () -> Unit,
     onUnsubscribe: () -> Unit,
@@ -200,6 +214,7 @@ internal fun FeedDetailPage(
 ) {
     var unfiltered by rememberSaveable(feed.keywordFilter) { mutableStateOf(false) }
     var showActions by rememberSaveable(feed.id) { mutableStateOf(false) }
+    var showNotifications by rememberSaveable(feed.id) { mutableStateOf(false) }
     var limit by rememberSaveable(feed.keywordFilter) { mutableIntStateOf(75) }
     var articles by remember { mutableStateOf<ArticleListing?>(null) }
     var loadedFilter by remember { mutableStateOf<Pair<KeywordFilter?, Boolean>?>(null) }
@@ -329,6 +344,7 @@ internal fun FeedDetailPage(
         val actions = buildList {
             if (site != feed.url) add("フィードURLを開く" to { onLink(feed.url) })
             add((if (feed.keywordFilter != null) "フィルターを編集" else "フィルターを設定") to onKeywordFilter)
+            add("新着通知を設定" to { showNotifications = true })
             if (webPage && feed.error != WEBSITE_SCOPE_CHANGED) add("監視範囲を変更" to onChangeWebsiteScope)
             add("購読を解除" to onUnsubscribe)
         }
@@ -350,6 +366,11 @@ internal fun FeedDetailPage(
                 }
             },
             confirmButton = { TextButton(onClick = { showActions = false }) { Text("閉じる") } },
+        )
+    }
+    if (showNotifications) {
+        FeedNotificationDialog(
+            feed.notifications, notificationSettings, { showNotifications = false }, onNotificationModeChange,
         )
     }
 }

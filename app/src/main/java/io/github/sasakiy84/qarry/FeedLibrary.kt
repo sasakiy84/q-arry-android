@@ -36,7 +36,7 @@ class QarryApplication : Application() {
     val library: FeedLibrary by lazy {
         FeedLibrary(
             FeedStore(this).apply { setWriteAheadLoggingEnabled(true) }, FeedClient(),
-            File(noBackupFilesDir, "bekko-a8m-c721113"),
+            File(noBackupFilesDir, "bekko-a8m-c721113"), this,
         )
     }
 
@@ -88,8 +88,10 @@ class FeedRefreshService : JobService() {
     }
 }
 
-class FeedLibrary(private val store: FeedStore, private val client: FeedClient, modelDir: File? = null) {
+class FeedLibrary(private val store: FeedStore, private val client: FeedClient, modelDir: File? = null, context: Context? = null) {
     internal val archive = ArticleArchive(store, client, modelDir)
+    internal val quotes = QuoteLearning(QuoteStore(store), context?.assets?.let(::BekkoQuoteEncoder))
+    private val notifications = context?.let(::FeedNotifications)
     private val changes = MutableStateFlow(0)
     val revision = changes.asStateFlow()
     private val activeRefresh = MutableStateFlow(false)
@@ -139,21 +141,22 @@ class FeedLibrary(private val store: FeedStore, private val client: FeedClient, 
     internal suspend fun importOpml(openInput: () -> InputStream?): FeedImportResult = change {
         val input = openInput() ?: throw IOException("OPML stream unavailable")
         val contents = input.use(::readOpml)
-        val added = store.importSubscriptions(contents.feeds)
-        Log.i(FEED_LOG, "Imported feeds=${added.size}")
-        FeedImportResult(
-            added,
-            contents.duplicateCount + contents.feeds.size - added.size,
-            contents.unsupportedCount,
-        )
+        val imported = store.importSubscriptions(contents)
+        Log.i(FEED_LOG, "Imported feeds=${imported.feedIds.size}")
+        imported.copy(duplicateCount = imported.duplicateCount + contents.feeds.size - imported.feedIds.size)
     }
 
     internal suspend fun exportOpml(openOutput: () -> OutputStream?): Int = runInterruptible(Dispatchers.IO) {
-        val feeds = store.subscriptions().map { OpmlFeed(it.url, it.title, it.homeUrl, it.htmlItemSelector, it.htmlWatch) }
-        val document = encodeOpml(feeds)
+        val contents = store.opmlSubscriptions()
+        val document = encodeOpml(contents.feeds, contents.queues)
         val output = openOutput() ?: throw IOException("OPML output stream unavailable")
         output.use { it.write(document) }
-        feeds.size
+        contents.feeds.size
+    }
+
+    internal suspend fun exportRatingHistory(openOutput: () -> OutputStream?): Int = runInterruptible(Dispatchers.IO) {
+        val output = openOutput() ?: throw IOException("Rating history output stream unavailable")
+        output.writer(Charsets.UTF_8).buffered().use(store::writeRatingHistory)
     }
 
     suspend fun subscribe(document: FeedDocument, queueId: Long?): Long = change {
@@ -174,6 +177,8 @@ class FeedLibrary(private val store: FeedStore, private val client: FeedClient, 
     suspend fun removeQueue(id: Long): Unit = change { store.removeQueue(id) }
     suspend fun removeFeed(id: Long): Unit = change { store.removeFeed(id) }
     suspend fun setFeedFavorite(id: Long, favorite: Boolean): Unit = change { store.setFeedFavorite(id, favorite) }
+    internal suspend fun setFeedNotifications(id: Long, mode: FeedNotificationMode): Unit =
+        change { store.setFeedNotifications(id, mode) }
     suspend fun markRead(id: Long, read: Boolean): Unit = change { store.setRead(id, read) }
     suspend fun markAllRead(queueId: Long?, unassignedOnly: Boolean = false): Int =
         change { store.markAllRead(queueId, unassignedOnly) }
@@ -219,7 +224,12 @@ class FeedLibrary(private val store: FeedStore, private val client: FeedClient, 
                                 val document = client.refresh(
                                     feed.url, feed.etag, feed.modified, feed.htmlItemSelector, feed.htmlWatch, oldKeys,
                                 )
-                                store.recordRefresh(feed.id, document, expected = feed)
+                                val notificationDefault = notifications?.takeIf { it.canPost() }?.defaultEnabled
+                                val result = store.recordRefresh(
+                                    feed.id, document, expected = feed, notificationDefault = notificationDefault,
+                                )
+                                if (result.newArticles != null) notifications?.post(result.newArticles)
+                                result.applied
                             } catch (error: FeedRequestException) {
                                 if (Thread.currentThread().isInterrupted) throw InterruptedException()
                                 store.recordRefresh(feed.id, null, expected = feed, error = error.message.orEmpty())
@@ -240,7 +250,9 @@ class FeedLibrary(private val store: FeedStore, private val client: FeedClient, 
         runInterruptible(Dispatchers.IO) { block().also { changes.update { count -> count + 1 } } }
 }
 
-internal data class FeedImportResult(val feedIds: Set<Long>, val duplicateCount: Int, val unsupportedCount: Int)
+internal data class FeedImportResult(
+    val feedIds: Set<Long>, val duplicateCount: Int, val unsupportedCount: Int, val createdQueues: Int = 0,
+)
 
 fun Context.feedLibrary(): FeedLibrary = (applicationContext as QarryApplication).library
 

@@ -1,6 +1,7 @@
 package io.github.sasakiy84.qarry
 
 import android.content.ActivityNotFoundException
+import android.content.Context
 import android.content.Intent
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
@@ -22,6 +23,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.core.net.toUri
+import androidx.core.content.edit
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -48,7 +50,13 @@ private val detailPathSaver = listSaver<List<DetailRoute>, String>(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun QarryScreen(library: FeedLibrary, onArticleOpenMode: (ArticleOpenMode) -> Unit) {
+internal fun QarryScreen(
+    library: FeedLibrary,
+    notificationFeedId: Long? = null,
+    onNotificationOpened: () -> Unit = {},
+    quoteLearning: QuoteLearning = library.quotes,
+    onArticleOpenMode: (ArticleOpenMode) -> Unit,
+) {
     var section by rememberSaveable { mutableStateOf(Section.Articles) }
     var queueId by rememberSaveable { mutableStateOf<Long?>(null) }
     var articlesUnassignedOnly by rememberSaveable { mutableStateOf(false) }
@@ -60,6 +68,7 @@ internal fun QarryScreen(library: FeedLibrary, onArticleOpenMode: (ArticleOpenMo
     var feedOrder by rememberSaveable { mutableStateOf(FeedOrder.Name) }
     var adding by rememberSaveable { mutableStateOf(false) }
     var searching by rememberSaveable { mutableStateOf(false) }
+    var quoteTraining by rememberSaveable { mutableStateOf(false) }
     var archivingArticle by remember { mutableStateOf<Long?>(null) }
     var editingWebsiteScope by rememberSaveable { mutableStateOf(false) }
     var savingFeedSetup by remember { mutableStateOf(false) }
@@ -81,8 +90,11 @@ internal fun QarryScreen(library: FeedLibrary, onArticleOpenMode: (ArticleOpenMo
     val snackbars = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
+    val quotePreferences = remember(context) { context.getSharedPreferences("quote_display", Context.MODE_PRIVATE) }
+    var quoteEnabled by remember(quotePreferences) { mutableStateOf(quotePreferences.getBoolean("enabled", false)) }
     val backDispatcher = LocalOnBackPressedDispatcherOwner.current?.onBackPressedDispatcher
     val articleOpenMode = LocalArticleOpenMode.current
+    val notificationSettings = rememberNotificationSettings()
     val articleFilter = ArticleListFilter(queueId, unread, articlesUnassignedOnly)
     val detail = detailPath.lastOrNull()
     val articleId = detail?.id?.takeIf { detail.kind == DetailKind.Article }
@@ -112,6 +124,21 @@ internal fun QarryScreen(library: FeedLibrary, onArticleOpenMode: (ArticleOpenMo
     fun navigateTo(route: DetailRoute) {
         if (detailPath.lastOrNull() == route) return
         updateDetailPath(detailPath + route)
+    }
+
+    LaunchedEffect(notificationFeedId) {
+        val id = notificationFeedId ?: return@LaunchedEffect
+        adding = false
+        searching = false
+        quoteTraining = false
+        editingWebsiteScope = false
+        dialogs.queueEditor = null
+        dialogs.managedFeedId = null
+        dialogs.filteredFeedId = null
+        dialogs.confirmDelete = null
+        section = Section.Feeds
+        updateDetailPath(listOf(DetailRoute(DetailKind.Feed, id)))
+        onNotificationOpened()
     }
 
     fun openArticle(id: Long?, url: String?, press: ArticlePress, summary: Article? = null, archivedKey: RatingKey? = null) {
@@ -167,7 +194,7 @@ internal fun QarryScreen(library: FeedLibrary, onArticleOpenMode: (ArticleOpenMo
         false
     }
 
-    val opml = rememberOpmlTransfer(library, snackbars, ::change)
+    val transfer = rememberLibraryTransfer(library, snackbars, ::change)
 
     LaunchedEffect(revision, articleFilter, limit) {
         try {
@@ -228,14 +255,15 @@ internal fun QarryScreen(library: FeedLibrary, onArticleOpenMode: (ArticleOpenMo
             savingFeedSetup -> Unit
             adding -> adding = false
             editingWebsiteScope -> editingWebsiteScope = false
+            quoteTraining -> quoteTraining = false
             detailPath.isNotEmpty() -> updateDetailPath(detailPath.dropLast(1))
             searching -> searching = false
             section != Section.Articles -> section = Section.Articles
         }
     }
 
-    BackHandler(adding || searching || detail != null || section != Section.Articles) { back() }
-    val fullScreen = adding || searching || detail != null
+    BackHandler(adding || searching || quoteTraining || detail != null || section != Section.Articles) { back() }
+    val fullScreen = adding || searching || quoteTraining || detail != null
     Scaffold(
         topBar = {
             TopAppBar(
@@ -244,6 +272,7 @@ internal fun QarryScreen(library: FeedLibrary, onArticleOpenMode: (ArticleOpenMo
                         Text(
                             when {
                                 adding -> "フィードを追加"
+                                quoteTraining -> QUOTE_TRAINING_TITLE
                                 editingWebsiteScope -> "監視範囲を変更"
                                 feedId != null -> "フィード詳細"
                                 openedQueueId != null -> "キュー"
@@ -311,6 +340,7 @@ internal fun QarryScreen(library: FeedLibrary, onArticleOpenMode: (ArticleOpenMo
                 val page = Modifier.widthIn(max = 760.dp).fillMaxSize()
                 val content = snapshot
                 when {
+                    quoteTraining -> QuoteTrainingPage(quoteLearning, page)
                     adding -> AddFeedPage(
                         library = library,
                         queueId = openedQueueId ?: queueId.takeIf { section == Section.Articles },
@@ -357,6 +387,7 @@ internal fun QarryScreen(library: FeedLibrary, onArticleOpenMode: (ArticleOpenMo
                                     }
                                 }) else null,
                                 fetchingFullText = archivingArticle == opened.id,
+                                quoteLearning = quoteLearning.takeIf { quoteEnabled },
                                 modifier = page,
                             )
                         }
@@ -370,10 +401,14 @@ internal fun QarryScreen(library: FeedLibrary, onArticleOpenMode: (ArticleOpenMo
                             onTab = { settingsTab = it },
                             articleOpenMode = articleOpenMode,
                             onArticleOpenMode = onArticleOpenMode,
-                            transfer = opml.transfer,
-                            choosingFile = opml.choosingFile,
-                            onImport = opml.onImport,
-                            onExport = opml.onExport,
+                            notificationSettings = notificationSettings,
+                            quoteEnabled = quoteEnabled,
+                            onQuoteEnabled = { enabled ->
+                                quoteEnabled = enabled
+                                quotePreferences.edit { putBoolean("enabled", enabled) }
+                            },
+                            onQuoteTraining = { quoteTraining = true },
+                            transfer = transfer,
                             archive = library.archive,
                             libraryRevision = revision,
                             viewed = history,
@@ -441,6 +476,15 @@ internal fun QarryScreen(library: FeedLibrary, onArticleOpenMode: (ArticleOpenMo
                                     onManage = { dialogs.managedFeedId = feed.id },
                                     onKeywordFilter = { dialogs.filteredFeedId = feed.id },
                                     onFavoriteChange = { favorite -> change { library.setFeedFavorite(feed.id, favorite) } },
+                                    notificationSettings = notificationSettings,
+                                    onNotificationModeChange = { mode ->
+                                        change {
+                                            library.setFeedNotifications(feed.id, mode)
+                                            if (mode.enabled(notificationSettings.defaultEnabled)) {
+                                                notificationSettings.requestPermission()
+                                            }
+                                        }
+                                    },
                                     onRefresh = { change { library.refresh(feed.id) } },
                                     onChangeWebsiteScope = { editingWebsiteScope = true },
                                     onUnsubscribe = { dialogs.confirmDelete = DeleteTarget.Feed(feed.id) },
