@@ -2,7 +2,6 @@ package io.github.sasakiy84.qarry
 
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -24,12 +23,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import java.net.URI
-
-internal fun LazyListScope.moreArticles(onMore: () -> Unit) {
-    item {
-        TextButton(onMore, Modifier.padding(start = 12.dp, top = 8.dp)) { Text("さらに表示") }
-    }
-}
 
 internal enum class SettingsTab(val label: String) {
     General("一般"),
@@ -59,6 +52,8 @@ internal fun SettingsPage(
     onChangeRating: (RatingKey, ArticleRating?) -> Unit,
     onMore: () -> Unit,
     modifier: Modifier = Modifier,
+    loadingMore: Boolean = false,
+    onRetryMore: (() -> Unit)? = null,
 ) {
     Column(modifier) {
         PageHeading("設定") { }
@@ -82,9 +77,13 @@ internal fun SettingsPage(
             SettingsTab.Viewed -> when {
                 viewed == null -> LoadingIndicator("閲覧履歴を読み込み中")
                 viewed.articles.isEmpty() -> EmptyState("閲覧履歴はありません", null)
-                else -> LazyColumn(contentPadding = PaddingValues(bottom = 24.dp)) {
-                    articleCards(viewed.articles, onArticle, onDismiss, history = true)
-                    if (viewed.hasMore) moreArticles(onMore)
+                else -> {
+                    val listState = rememberLazyListState()
+                    LoadNextArticlePage(listState, viewed.articles.size, viewed.hasMore && !loadingMore && onRetryMore == null, onMore)
+                    LazyColumn(state = listState, contentPadding = PaddingValues(bottom = 24.dp)) {
+                        articleCards(viewed.articles, onArticle, onDismiss, history = true)
+                        articlePageFooter(loadingMore, onRetryMore)
+                    }
                 }
             }
             SettingsTab.Rated -> Column {
@@ -98,12 +97,16 @@ internal fun SettingsPage(
                 when {
                     rated == null -> LoadingIndicator("評価履歴を読み込み中")
                     rated.articles.isEmpty() -> EmptyState("評価履歴はありません", null)
-                    else -> LazyColumn(contentPadding = PaddingValues(bottom = 24.dp)) {
-                        items(rated.articles, key = { "${it.key.feedUrl}\n${it.key.entryKey}" }) { entry ->
-                            RatingHistoryRow(entry, { onRatedArticle(entry, it) }, { onChangeRating(entry.key, it) })
-                            HorizontalDivider(Modifier.padding(horizontal = 20.dp))
+                    else -> {
+                        val listState = rememberLazyListState()
+                        LoadNextArticlePage(listState, rated.articles.size, rated.hasMore && !loadingMore && onRetryMore == null, onMore)
+                        LazyColumn(state = listState, contentPadding = PaddingValues(bottom = 24.dp)) {
+                            items(rated.articles, key = { "${it.key.feedUrl}\n${it.key.entryKey}" }) { entry ->
+                                RatingHistoryRow(entry, { onRatedArticle(entry, it) }, { onChangeRating(entry.key, it) })
+                                HorizontalDivider(Modifier.padding(horizontal = 20.dp))
+                            }
+                            articlePageFooter(loadingMore, onRetryMore)
                         }
-                        if (rated.hasMore) moreArticles(onMore)
                     }
                 }
             }
@@ -232,7 +235,8 @@ internal fun FeedDetailPage(
         }
     }
     val listing = articles
-    if (failed) {
+    val loadingMore = listing != null && loadedFilter == filter && listing.hasMore && listing.articles.size < limit
+    if (failed && !loadingMore) {
         EmptyState("フィードの記事を読み込めませんでした", null, { attempt++ }, "再試行")
         return
     }
@@ -247,6 +251,7 @@ internal fun FeedDetailPage(
     }
 
     val listState = key(feed.keywordFilter, showingUnfiltered) { rememberLazyListState() }
+    LoadNextArticlePage(listState, listing.articles.size + 1, listing.hasMore && !loadingMore) { limit += 75 }
     LazyColumn(modifier, state = listState, contentPadding = PaddingValues(bottom = 24.dp)) {
         item {
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -338,7 +343,7 @@ internal fun FeedDetailPage(
             }
         }
         articleCards(listing.articles, onArticle, onDismiss, showFeedTitle = false)
-        if (listing.hasMore) moreArticles { limit += 75 }
+        articlePageFooter(loadingMore, if (failed) ({ attempt++ }) else null)
     }
     if (showActions) {
         val actions = buildList {

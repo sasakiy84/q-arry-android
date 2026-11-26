@@ -52,6 +52,8 @@ internal fun ArticlesPage(
     loading: Boolean = false,
     unassignedOnly: Boolean = false,
     onDismissQueueArticles: ((Boolean) -> Unit)? = null,
+    loadingMore: Boolean = false,
+    onRetryMore: (() -> Unit)? = null,
 ) {
     val queue = snapshot.queues.firstOrNull { it.id == queueId }
     var confirmMarkAllRead by rememberSaveable { mutableStateOf(false) }
@@ -119,9 +121,10 @@ internal fun ArticlesPage(
                 actionLabel = "フィードを追加",
             )
         } else {
+            LoadNextArticlePage(listState, snapshot.articles.size, snapshot.hasMore && !loadingMore && onRetryMore == null, onMore)
             LazyColumn(state = listState, modifier = Modifier.weight(1f), contentPadding = PaddingValues(bottom = 24.dp)) {
                 articleCards(snapshot.articles, onArticle, onDismiss)
-                if (snapshot.hasMore) moreArticles(onMore)
+                articlePageFooter(loadingMore, onRetryMore)
             }
         }
     }
@@ -176,8 +179,9 @@ internal fun QueueArticlesPage(
         }
     }
     val content = snapshot
+    val loadingMore = content != null && loadedUnread == unread && content.hasMore && content.articles.size < limit
     when {
-        failed -> EmptyState("記事を読み込めませんでした", null, { attempt++ }, "再試行")
+        failed && !loadingMore -> EmptyState("記事を読み込めませんでした", null, { attempt++ }, "再試行")
         content == null -> LoadingIndicator("キューの記事を読み込み中")
         else -> ArticlesPage(
             content, queueId, unread, markingRead,
@@ -185,6 +189,8 @@ internal fun QueueArticlesPage(
             onAdd = onAdd, onMore = { limit += 75 }, onArticle = onArticle, onDismiss = onDismiss,
             modifier = modifier, showQueuePicker = false, loading = unread != loadedUnread,
             onDismissQueueArticles = onDismissQueueArticles,
+            loadingMore = loadingMore,
+            onRetryMore = if (failed) ({ attempt++ }) else null,
         )
     }
 }

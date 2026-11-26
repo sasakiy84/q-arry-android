@@ -73,9 +73,13 @@ internal fun QarryScreen(
     var editingWebsiteScope by rememberSaveable { mutableStateOf(false) }
     var savingFeedSetup by remember { mutableStateOf(false) }
     var limit by rememberSaveable { mutableIntStateOf(75) }
+    var articleLoadAttempt by remember { mutableIntStateOf(0) }
+    var articleLoadFailed by remember { mutableStateOf(false) }
     var settingsTab by rememberSaveable { mutableStateOf(SettingsTab.General) }
     var historyLimit by rememberSaveable { mutableIntStateOf(75) }
     var ratingLimit by rememberSaveable { mutableIntStateOf(75) }
+    var settingsLoadAttempt by remember { mutableIntStateOf(0) }
+    var failedSettingsTab by remember { mutableStateOf<SettingsTab?>(null) }
     val listStates = rememberSaveableStateHolder()
     var snapshot by remember { mutableStateOf<LibrarySnapshot?>(null) }
     var loadedArticleFilter by remember { mutableStateOf<ArticleListFilter?>(null) }
@@ -96,6 +100,13 @@ internal fun QarryScreen(
     val articleOpenMode = LocalArticleOpenMode.current
     val notificationSettings = rememberNotificationSettings()
     val articleFilter = ArticleListFilter(queueId, unread, articlesUnassignedOnly)
+    val articlesLoadingMore = loadedArticleFilter == articleFilter &&
+        snapshot?.let { it.hasMore && it.articles.size < limit } == true
+    val settingsLoadingMore = when (settingsTab) {
+        SettingsTab.General -> false
+        SettingsTab.Viewed -> history?.let { it.hasMore && it.articles.size < historyLimit } == true
+        SettingsTab.Rated -> ratings?.let { it.hasMore && it.articles.size < ratingLimit } == true
+    }
     val detail = detailPath.lastOrNull()
     val articleId = detail?.id?.takeIf { detail.kind == DetailKind.Article }
     val feedId = detail?.id?.takeIf { detail.kind == DetailKind.Feed }
@@ -196,7 +207,8 @@ internal fun QarryScreen(
 
     val transfer = rememberLibraryTransfer(library, snackbars, ::change)
 
-    LaunchedEffect(revision, articleFilter, limit) {
+    LaunchedEffect(revision, articleFilter, limit, articleLoadAttempt) {
+        articleLoadFailed = false
         try {
             val (requestedQueue, unreadOnly, unassignedOnly) = articleFilter
             val loaded = library.load(requestedQueue, unreadOnly, limit, unassignedOnly)
@@ -204,18 +216,22 @@ internal fun QarryScreen(
             snapshot = loaded
             loadedArticleFilter = articleFilter
         } catch (_: android.database.sqlite.SQLiteException) {
-            snackbars.showSnackbar("端末のデータを読み込めませんでした。")
+            if (articlesLoadingMore) articleLoadFailed = true
+            else snackbars.showSnackbar("端末のデータを読み込めませんでした。")
         }
     }
 
-    LaunchedEffect(articleId, detail, adding, section, revision, archiveRevision.takeIf { articleId != null }, settingsTab, historyLimit, ratingLimit) {
+    LaunchedEffect(articleId, detail, adding, section, revision, archiveRevision.takeIf { articleId != null }, settingsTab,
+        historyLimit, ratingLimit, settingsLoadAttempt) {
+        val loadingSettings = detail == null && !adding && section == Section.Settings
+        if (loadingSettings) failedSettingsTab = null
         try {
             when {
                 articleId != null -> {
                     val loaded = library.article(articleId)
                     if (loaded == null) updateDetailPath(detailPath.dropLast(1)) else article = loaded
                 }
-                detail == null && !adding && section == Section.Settings -> when (settingsTab) {
+                loadingSettings -> when (settingsTab) {
                     SettingsTab.General -> Unit
                     SettingsTab.Viewed -> {
                         // An article can move to the top of history when viewed. Restore the list against its new order.
@@ -226,7 +242,8 @@ internal fun QarryScreen(
                 }
             }
         } catch (_: android.database.sqlite.SQLiteException) {
-            snackbars.showSnackbar("端末のデータを読み込めませんでした。")
+            if (loadingSettings && settingsLoadingMore) failedSettingsTab = settingsTab
+            else snackbars.showSnackbar("端末のデータを読み込めませんでした。")
         }
     }
 
@@ -425,6 +442,8 @@ internal fun QarryScreen(
                                 }
                             },
                             modifier = page,
+                            loadingMore = settingsLoadingMore,
+                            onRetryMore = if (settingsLoadingMore && failedSettingsTab == settingsTab) ({ settingsLoadAttempt++ }) else null,
                         )
                     }
                     content == null -> LoadingIndicator("購読情報を読み込み中")
@@ -510,6 +529,8 @@ internal fun QarryScreen(
                             modifier = page,
                             loading = loadedArticleFilter != articleFilter,
                             unassignedOnly = articlesUnassignedOnly,
+                            loadingMore = articlesLoadingMore,
+                            onRetryMore = if (articlesLoadingMore && articleLoadFailed) ({ articleLoadAttempt++ }) else null,
                             onDismissQueueArticles = queueId?.let { selectedQueue ->
                                 { unreadOnly -> dialogs.confirmDelete = DeleteTarget.QueueArticles(selectedQueue, unreadOnly) }
                             },

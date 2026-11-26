@@ -60,7 +60,7 @@ internal fun ArticleThumbnail(image: ArticleImage, modifier: Modifier = Modifier
     val imageUrl = image.url
     var imageLoaded by remember(imageUrl) { mutableStateOf(false) }
     Box(
-        modifier.clip(RoundedCornerShape(12.dp)).background(MaterialTheme.colorScheme.surfaceVariant),
+        modifier.clip(RoundedCornerShape(1.dp)).background(MaterialTheme.colorScheme.surfaceVariant),
         contentAlignment = Alignment.Center,
     ) {
         if (!imageLoaded) {

@@ -5,6 +5,7 @@ import android.text.format.Formatter
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
@@ -35,6 +36,7 @@ internal fun ArticleSearchPage(
     var limit by rememberSaveable { mutableIntStateOf(60) }
     var attempt by remember { mutableIntStateOf(0) }
     var result by remember { mutableStateOf<ArticleSearchResult?>(null) }
+    var loadedLimit by remember { mutableIntStateOf(0) }
     var failed by remember { mutableStateOf(false) }
     val archiveRevision by archive.revision.collectAsState()
     val focus = LocalFocusManager.current
@@ -52,8 +54,10 @@ internal fun ArticleSearchPage(
             return@LaunchedEffect
         }
         failed = false
+        val requestedLimit = limit
         try {
-            result = archive.search(query, limit)
+            result = archive.search(query, requestedLimit)
+            loadedLimit = requestedLimit
         } catch (_: SQLiteException) {
             failed = true
         }
@@ -76,9 +80,10 @@ internal fun ArticleSearchPage(
             Button(onClick = ::submit, enabled = input.isNotBlank()) { Text("検索") }
         }
         val loaded = result
+        val loadingMore = loaded != null && loadedLimit < limit
         when {
             query.isBlank() -> Unit
-            failed -> EmptyState("検索できませんでした", null, { attempt++ }, "再試行")
+            failed && !loadingMore -> EmptyState("検索できませんでした", null, { attempt++ }, "再試行")
             loaded == null -> LoadingIndicator("検索中")
             else -> {
                 if (loaded.semanticUnavailable) {
@@ -88,7 +93,9 @@ internal fun ArticleSearchPage(
                 if (loaded.listing.articles.isEmpty()) {
                     EmptyState("該当する記事がありません", null)
                 } else {
-                    LazyColumn(contentPadding = PaddingValues(bottom = 24.dp)) {
+                    val listState = key(query) { rememberLazyListState() }
+                    LoadNextArticlePage(listState, loaded.listing.articles.size, loaded.listing.hasMore && !loadingMore) { limit += 60 }
+                    LazyColumn(state = listState, contentPadding = PaddingValues(bottom = 24.dp)) {
                         items(loaded.listing.articles, key = { it.id }) { article ->
                             ListItem(
                                 headlineContent = { Text(article.displayTitle, maxLines = 2, overflow = TextOverflow.Ellipsis) },
@@ -98,9 +105,7 @@ internal fun ArticleSearchPage(
                             )
                             HorizontalDivider(Modifier.padding(horizontal = 16.dp))
                         }
-                        if (loaded.listing.hasMore) {
-                            moreArticles { limit += 60 }
-                        }
+                        articlePageFooter(loadingMore, if (failed) ({ attempt++ }) else null)
                     }
                 }
             }

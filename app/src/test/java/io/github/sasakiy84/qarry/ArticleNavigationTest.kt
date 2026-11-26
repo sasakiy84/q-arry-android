@@ -24,6 +24,53 @@ import kotlin.math.abs
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36], qualifiers = "ja-w360dp-h800dp-mdpi")
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
+class ArticlePaginationTest {
+    @Test
+    fun scrollingNearTheEndLoadsOnePageAtATimeUntilAllArticlesAreShown() {
+        FeedStore(RuntimeEnvironment.getApplication()).use { store ->
+            store.subscribe(FeedDocument(
+                "https://publisher.example/feed", "サンプルフィード", null,
+                List(160) { index ->
+                    FeedArticle(index.toString(), "ページ送りの記事 $index", null, "記事の説明", (160 - index) * 1_000L)
+                },
+            ), null)
+            val articles = store.load(null, true, 160).articles
+            Robolectric.buildActivity(MainActivity::class.java).setup().windowFocusChanged(true).use { controller ->
+                val screen = ComposeScreen(controller.get().window.decorView)
+                fun list() = screen.find("記事一覧") {
+                    SemanticsActions.ScrollToIndex in it.config && SemanticsProperties.VerticalScrollAxisRange in it.config
+                }
+                fun scrollTo(index: Int) {
+                    assertTrue(checkNotNull(list().config[SemanticsActions.ScrollToIndex].action).invoke(index))
+                }
+                fun SemanticsNode.indexOfArticle(index: Int) = config[SemanticsProperties.IndexForKey](articles[index].id)
+
+                scrollTo(40)
+                screen.find("最初のページの途中") { articles[40].displayTitle in it.text() }
+                assertEquals(-1, list().indexOfArticle(75))
+
+                scrollTo(69)
+                val secondPage = screen.find("次の75件が追加された一覧") {
+                    SemanticsProperties.IndexForKey in it.config && it.indexOfArticle(75) == 75
+                }
+                assertEquals(-1, secondPage.indexOfArticle(150))
+                assertTrue(secondPage.config[SemanticsProperties.VerticalScrollAxisRange].value() >= 65f)
+
+                scrollTo(144)
+                screen.find("最後のページが追加された一覧") {
+                    SemanticsProperties.IndexForKey in it.config && it.indexOfArticle(159) == 159
+                }
+                scrollTo(159)
+                screen.find("最後の記事") { articles[159].displayTitle in it.text() }
+                assertTrue(screen.nodes().none { it.text() == "さらに表示" })
+            }
+        }
+    }
+}
+
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [36], qualifiers = "ja-w360dp-h800dp-mdpi")
+@GraphicsMode(GraphicsMode.Mode.NATIVE)
 class ArticleNavigationTest {
     @Test
     fun sharesArticleAndRestoresEachArticleListAtTheSameScrollOffset() {
