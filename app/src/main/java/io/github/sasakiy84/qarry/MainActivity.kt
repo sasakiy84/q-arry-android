@@ -1,7 +1,9 @@
 package io.github.sasakiy84.qarry
 
 import android.content.Intent
+import android.database.sqlite.SQLiteException
 import android.os.Bundle
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -11,9 +13,13 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.*
 import androidx.compose.ui.graphics.Color
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     private var notificationFeedId by mutableStateOf<Long?>(null)
+    private var openRefresh: Job? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -37,6 +43,25 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        val app = application as QarryApplication
+        val client = app.backgroundUpdates.claimOpenRefresh() ?: return
+        openRefresh = lifecycleScope.launch {
+            try {
+                app.library.refresh(requestClient = client)
+            } catch (_: SQLiteException) {
+                Log.w("QarryFeeds", "Refresh on open could not access the database")
+            }
+        }
+    }
+
+    override fun onStop() {
+        openRefresh?.cancel()
+        openRefresh = null
+        super.onStop()
     }
 
     override fun onNewIntent(intent: Intent) {

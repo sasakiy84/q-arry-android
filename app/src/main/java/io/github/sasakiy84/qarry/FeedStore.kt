@@ -35,6 +35,8 @@ enum class ArticleRating(val value: Int, val label: String) {
     Bad(-1, "Bad"),
 }
 
+internal const val UNTITLED_ARTICLE = "無題の記事"
+
 data class Article(
     val id: Long,
     val feedTitle: String,
@@ -54,8 +56,9 @@ data class Article(
     val discoveredAt: Long? = null,
     val originalOpenedAt: Long? = null,
     val archivedBody: String? = null,
+    val archivedFormat: String? = null,
 ) {
-    val displayTitle: String get() = title ?: url ?: "無題の記事"
+    val displayTitle: String get() = title ?: url ?: UNTITLED_ARTICLE
 }
 
 data class FeedQueue(val id: Long, val name: String, val feedCount: Int)
@@ -89,7 +92,7 @@ data class LibrarySnapshot(
     val hasUnread: Boolean = articles.any { !it.read },
 )
 
-class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null, 12) {
+class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null, 13) {
     override fun onConfigure(db: SQLiteDatabase): Unit = db.setForeignKeyConstraintsEnabled(true)
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -155,7 +158,7 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        check(oldVersion in 1..11 && newVersion == 12) { "No database migration from $oldVersion to $newVersion" }
+        check(oldVersion in 1..12 && newVersion == 13) { "No database migration from $oldVersion to $newVersion" }
         if (oldVersion == 1) {
             db.execSQL("ALTER TABLE feed ADD COLUMN html_item_selector TEXT")
             db.execSQL("ALTER TABLE article ADD COLUMN thumbnail_url TEXT")
@@ -182,8 +185,9 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
             createArticleActions(db)
         }
         if (oldVersion < 10) createArticleSearch(db)
+        else db.execSQL("ALTER TABLE article_archive ADD COLUMN formatting TEXT")
         if (oldVersion < 11) db.execSQL("ALTER TABLE feed ADD COLUMN notifications INTEGER NOT NULL DEFAULT 0")
-        createQuoteTables(db)
+        if (oldVersion < 12) createQuoteTables(db)
     }
 
     private fun createArticleSearch(db: SQLiteDatabase) {
@@ -192,7 +196,8 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
             CREATE TABLE article_archive (
                 article_id INTEGER PRIMARY KEY REFERENCES article(id) ON DELETE CASCADE,
                 body TEXT,
-                retry_at INTEGER NOT NULL
+                retry_at INTEGER NOT NULL,
+                formatting TEXT
             )
             """.trimIndent(),
         )
@@ -344,7 +349,7 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
     )
 
     fun article(id: Long): Article? = readableDatabase.rawQuery(
-        "${articleQuery("a.body", "(SELECT body FROM article_archive WHERE article_id = a.id)")} WHERE a.id = ?",
+        "${articleQuery("a.body", "t.body", "t.formatting")} LEFT JOIN article_archive t ON t.article_id = a.id WHERE a.id = ?",
         arrayOf(id.toString()),
     ).use { cursor -> if (cursor.moveToFirst()) cursor.readArticle() else null }
 
@@ -357,22 +362,27 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
         arrayOf(now.toString(), limit.toString()),
     ).use { it.rows { ArchiveCandidate(getLong(0), getString(1)) } }
 
-    internal fun saveArchive(candidate: ArchiveCandidate, body: String?, retryAt: Long): Boolean = writableDatabase.transaction {
+    internal fun saveArchive(
+        candidate: ArchiveCandidate, body: String?, retryAt: Long, formatting: String? = null,
+    ): Boolean = writableDatabase.transaction {
         val args = arrayOf(candidate.id.toString(), candidate.url)
         val current = rawQuery(
-            "SELECT t.body, SUBSTR(a.body, 1, $MAX_ARCHIVE_CHARS) FROM article a LEFT JOIN article_archive t ON t.article_id = a.id WHERE a.id = ? AND a.url = ?",
+            "SELECT t.body, SUBSTR(a.body, 1, $MAX_ARCHIVE_CHARS), t.formatting FROM article a LEFT JOIN article_archive t ON t.article_id = a.id WHERE a.id = ? AND a.url = ?",
             args,
-        ).use { if (it.moveToFirst()) it.getString(0) to it.getString(1) else null } ?: return@transaction false
-        val candidateBody = body?.takeIf { it.length >= current.second.length * 0.8 }
-        val next = candidateBody ?: current.first
+        ).use { if (it.moveToFirst()) Triple(it.getString(0), it.getString(1), it.getString(2)) else null }
+            ?: return@transaction false
+        val (existingBody, feedBody, existingFormat) = current
+        val candidateBody = body?.takeIf { it.length >= feedBody.length * 0.8 }
+        val next = candidateBody ?: existingBody
+        val nextFormat = if (candidateBody != null) formatting else existingFormat
         execSQL(
             """
-            INSERT INTO article_archive(article_id, body, retry_at) VALUES (?, ?, ?)
-            ON CONFLICT(article_id) DO UPDATE SET body = excluded.body, retry_at = excluded.retry_at
+            INSERT INTO article_archive(article_id, body, retry_at, formatting) VALUES (?, ?, ?, ?)
+            ON CONFLICT(article_id) DO UPDATE SET body = excluded.body, retry_at = excluded.retry_at, formatting = excluded.formatting
             """.trimIndent(),
-            arrayOf<Any?>(candidate.id, next, retryAt),
+            arrayOf<Any?>(candidate.id, next, retryAt, nextFormat),
         )
-        if (next != current.first) {
+        if (next != existingBody) {
             execSQL("DELETE FROM article_fts WHERE docid = ?", arrayOf(candidate.id))
             execSQL("DELETE FROM article_vector WHERE article_id = ?", arrayOf(candidate.id))
         }
@@ -478,7 +488,9 @@ class FeedStore(context: Context) : SQLiteOpenHelper(context, "q-arry.db", null,
             articles = count("SELECT COUNT(*) FROM article"),
             archived = count("SELECT COUNT(body) FROM article_archive"),
             indexed = count("SELECT COUNT(*) FROM article_fts"),
-            archiveBytes = count("SELECT COALESCE(SUM(length(CAST(body AS BLOB))), 0) FROM article_archive"),
+            archiveBytes = count(
+                "SELECT COALESCE(SUM(length(CAST(body AS BLOB)) + COALESCE(length(CAST(formatting AS BLOB)), 0)), 0) FROM article_archive",
+            ),
             lexicalBytes = pageBytes("name GLOB 'article_fts_*'"),
             vectors = count("SELECT COUNT(*) FROM article_vector"),
             vectorBytes = pageBytes("name = 'article_vector'"),
@@ -931,6 +943,7 @@ private fun Cursor.readArticle(): Article =
         changeDetectedAt = nullableLong(14), discoveredAt = getLong(15),
         originalOpenedAt = nullableLong(16),
         archivedBody = getString(17),
+        archivedFormat = getString(18),
     )
 
 private const val ACTIVE_ARTICLE = "a.dismissed = 0 AND r.rating IS NULL"
@@ -972,10 +985,10 @@ private const val ARTICLE_FROM = """
     LEFT JOIN article_feedback r ON r.feed_url = f.url AND r.entry_key = a.entry_key
 """
 
-private fun articleQuery(body: String, archivedBody: String = "NULL"): String = """
+private fun articleQuery(body: String, archivedBody: String = "NULL", archivedFormat: String = "NULL"): String = """
     SELECT a.id, f.title, NULLIF(a.title, ''), a.url, NULLIF($body, ''), a.published, a.read,
            a.thumbnail_url, a.feed_id, a.viewed_at, a.dismissed OR r.rating IS NOT NULL, r.rating,
-           a.source_updated_at, a.source_published_at, a.change_detected_at, a.discovered, a.original_opened_at, $archivedBody
+           a.source_updated_at, a.source_published_at, a.change_detected_at, a.discovered, a.original_opened_at, $archivedBody, $archivedFormat
     $ARTICLE_FROM
 """.trimIndent()
 

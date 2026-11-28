@@ -64,19 +64,26 @@ class FeedLibrary(private val store: FeedStore, private val client: FeedClient, 
     internal suspend fun ratingHistory(limit: Int): RatingListing =
         runInterruptible(Dispatchers.IO) { store.ratingHistory(limit) }
 
-    internal suspend fun articleMetadata(url: String): ArticleMetadata? = metadataConnections.withPermit {
+    private fun cachedMetadataLookup(url: String): MetadataLookup? =
         metadataLookups.get(url)?.takeIf { it.expiresAt > SystemClock.elapsedRealtime() }
-            ?.let { return@withPermit it.metadata }
-        val metadata = runInterruptible(Dispatchers.IO) {
-            try {
-                client.articleMetadata(url)
-            } catch (_: IOException) {
-                if (Thread.currentThread().isInterrupted) throw InterruptedException()
-                null
+
+    internal fun cachedArticleMetadata(url: String): ArticleMetadata? = cachedMetadataLookup(url)?.metadata
+
+    internal suspend fun articleMetadata(url: String): ArticleMetadata? {
+        cachedMetadataLookup(url)?.let { return it.metadata }
+        return metadataConnections.withPermit {
+            cachedMetadataLookup(url)?.let { return@withPermit it.metadata }
+            val metadata = runInterruptible(Dispatchers.IO) {
+                try {
+                    client.articleMetadata(url)
+                } catch (_: IOException) {
+                    if (Thread.currentThread().isInterrupted) throw InterruptedException()
+                    null
+                }
             }
+            metadataLookups.put(url, MetadataLookup(metadata, SystemClock.elapsedRealtime() + METADATA_LOOKUP_TTL))
+            metadata
         }
-        metadataLookups.put(url, MetadataLookup(metadata, SystemClock.elapsedRealtime() + METADATA_LOOKUP_TTL))
-        metadata
     }
 
     internal suspend fun search(url: String): FeedDiscovery =

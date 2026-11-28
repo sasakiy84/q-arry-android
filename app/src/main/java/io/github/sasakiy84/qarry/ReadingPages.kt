@@ -122,26 +122,38 @@ internal fun SettingsPage(
 private fun BackgroundUpdateOptions() {
     val updates = (LocalContext.current.applicationContext as QarryApplication).backgroundUpdates
     var settings by remember(updates) { mutableStateOf(updates.settings) }
+    fun update(next: BackgroundUpdateSettings) {
+        updates.update(next)
+        settings = next
+    }
     Column(Modifier.padding(vertical = 12.dp)) {
         Text(
             "バックグラウンド通信", Modifier.padding(horizontal = 20.dp).semantics { heading() },
             style = MaterialTheme.typography.titleMedium,
         )
+        BackgroundUpdateSwitch(
+            "フィードはアプリを開いたときだけ更新", settings.feedOnOpenOnly,
+            detail = if (settings.feedOnOpenOnly) "自動更新の間隔は最低30分" else "現在は約12時間ごとに自動更新",
+        ) { checked ->
+            update(settings.copy(feedOnOpenOnly = checked))
+        }
         BackgroundUpdateSwitch("フィードの自動更新は Wi-Fi のみ", settings.feedWifiOnly) { checked ->
-            settings = settings.copy(feedWifiOnly = checked)
-            updates.update(settings)
+            update(settings.copy(feedWifiOnly = checked))
         }
         BackgroundUpdateSwitch("自動全文取得は非従量制回線のみ", settings.archiveUnmeteredOnly) { checked ->
-            settings = settings.copy(archiveUnmeteredOnly = checked)
-            updates.update(settings)
+            update(settings.copy(archiveUnmeteredOnly = checked))
+        }
+        BackgroundUpdateSwitch("自動全文取得は充電中のみ", settings.archiveChargingOnly) { checked ->
+            update(settings.copy(archiveChargingOnly = checked))
         }
     }
 }
 
 @Composable
-private fun BackgroundUpdateSwitch(label: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
+private fun BackgroundUpdateSwitch(label: String, checked: Boolean, detail: String? = null, onCheckedChange: (Boolean) -> Unit) {
     ListItem(
         headlineContent = { Text(label) },
+        supportingContent = if (detail != null) { { Text(detail) } } else null,
         trailingContent = { Switch(checked = checked, onCheckedChange = null) },
         modifier = Modifier.toggleable(checked, role = Role.Switch, onValueChange = onCheckedChange),
     )
@@ -194,12 +206,13 @@ private fun FeedTransferSettings(actions: LibraryTransferActions) {
 
 @Composable
 private fun RatingHistoryRow(entry: RatedArticle, onOpen: (ArticlePress) -> Unit, onChange: (ArticleRating?) -> Unit) {
-    val metadata = rememberArticleMetadata(entry.url)
-    val image = rememberArticleImage(metadata?.imageUrl, entry.thumbnailUrl)
+    val metadata = rememberArticleMetadata(entry.url, fetchIfMissing = false)
+    val image = rememberArticleImage(entry.thumbnailUrl, metadata?.imageUrl)
+    val title = entry.title.takeUnless { it == entry.url || it == UNTITLED_ARTICLE } ?: metadata?.title ?: entry.title
     val canOpen = entry.articleId != null || entry.url?.let(::webUrl) != null
     val largeText = LocalDensity.current.fontScale >= 1.5f
     ListItem(
-        headlineContent = { Text(metadata?.title ?: entry.title, maxLines = if (largeText) 2 else 1, overflow = TextOverflow.Ellipsis) },
+        headlineContent = { Text(title, maxLines = if (largeText) 2 else 1, overflow = TextOverflow.Ellipsis) },
         overlineContent = { Text(entry.feedTitle, maxLines = 1, overflow = TextOverflow.Ellipsis) },
         supportingContent = { Text(entryDate(entry.ratedAt)) },
         trailingContent = {

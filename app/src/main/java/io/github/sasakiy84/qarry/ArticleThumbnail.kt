@@ -23,12 +23,16 @@ import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 
 @Composable
-internal fun rememberArticleMetadata(articleUrl: String?): ArticleMetadata? {
+internal fun rememberArticleMetadata(articleUrl: String?, fetchIfMissing: Boolean = true): ArticleMetadata? {
     val library = LocalContext.current.feedLibrary()
     val pageUrl = remember(articleUrl) { httpsUrl(articleUrl) }
-    var metadata by remember(library, pageUrl) { mutableStateOf<ArticleMetadata?>(null) }
-    LaunchedEffect(library, pageUrl) {
-        metadata = pageUrl?.let { library.articleMetadata(it) }
+    var metadata by remember(library, pageUrl, fetchIfMissing) {
+        mutableStateOf(pageUrl?.let(library::cachedArticleMetadata))
+    }
+    if (pageUrl != null && fetchIfMissing) {
+        LaunchedEffect(library, pageUrl) {
+            metadata = library.articleMetadata(pageUrl)
+        }
     }
     return metadata
 }

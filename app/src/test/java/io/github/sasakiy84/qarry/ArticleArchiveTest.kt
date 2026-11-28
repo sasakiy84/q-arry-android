@@ -40,8 +40,11 @@ class ArticleArchiveTest {
         val html = """
             <nav><a href="/menu">共通ナビゲーション</a></nav>
             <main><article><h1>地域の図書館を訪ねて</h1>
-            <p>この地域に残る貴重な資料を分析しました。研究者は歴史資料を電子化し、図書館の利用者がいつでも読めるようにしています。</p>
+            <h2>保存資料の調査</h2>
+            <p>この地域に残る貴重な資料を分析しました。研究者は<a href="/collections?q=history#digital">歴史<em>資料</em></a>を電子化し、図書館の利用者がいつでも読めるようにしています。</p>
+            <h5>追加資料</h5>
             <p>紀要の続報にはＣＳＳの更新情報と、紙資料の保存技術についての詳しい解説を掲載します。</p>
+            <p>資料のとりまとめは<a href="javascript:void(0)">こちら</a>に記載しています。</p>
             <div class="post-related"><p>広告キャンペーンのお知らせ</p></div>
             </article></main>
             <footer><p>運営会社についてのお問い合わせ</p></footer>
@@ -62,9 +65,18 @@ class ArticleArchiveTest {
             assertEquals(1, archive.fetchPending())
             assertEquals(0, archive.fetchPending())
 
-            val saved = checkNotNull(store.article(id)?.archivedBody)
+            val archived = checkNotNull(store.article(id))
+            val saved = checkNotNull(archived.archivedBody)
             assertTrue("\n\n" in saved && "資料を電子化" in saved)
             assertFalse("運営会社" in saved || "広告キャンペーン" in saved || "共通ナビゲーション" in saved)
+            val paragraphs = archivedParagraphs(saved, archived.archivedFormat)
+            assertEquals(listOf(1, 2, 5), paragraphs.map { it.headingLevel }.filter { it > 0 })
+            val linked = paragraphs.single { it.links.isNotEmpty() }
+            val link = linked.links.single()
+            assertEquals("歴史資料", linked.text.substring(link.start, link.end))
+            assertEquals("https://publisher.example/collections?q=history#digital", link.url)
+            assertTrue("こちら" in saved)
+            assertFalse("publisher.example" in saved)
             for (query in listOf("資料を電子化", "保存技術 Ｃｓｓ", "館")) {
                 val matches = archive.search(query, 10).listing.articles
                 assertEquals(query, listOf(id), matches.map { it.id })
@@ -78,6 +90,7 @@ class ArticleArchiveTest {
 
             store.subscribe(document.copy(articles = document.articles.map { it.copy(url = "$url/moved") }), null)
             assertNull(store.article(id)?.archivedBody)
+            assertNull(store.article(id)?.archivedFormat)
             assertTrue(archive.search("保存技術", 10).listing.articles.isEmpty())
             store.removeFeed(feed)
             assertEquals(0L, archive.stats().indexed)

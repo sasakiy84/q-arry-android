@@ -96,7 +96,7 @@ internal class ArticleArchive(private val store: FeedStore, private val client: 
     }
 
     private fun fetch(candidate: ArchiveCandidate, requestClient: FeedClient): Boolean {
-        val body = try {
+        val article = try {
             requestClient.articleText(candidate.url)
         } catch (_: IOException) {
             if (Thread.currentThread().isInterrupted) throw InterruptedException()
@@ -104,7 +104,8 @@ internal class ArticleArchive(private val store: FeedStore, private val client: 
         }
         if (Thread.currentThread().isInterrupted) throw InterruptedException()
         val now = System.currentTimeMillis()
-        return store.saveArchive(candidate, body, now + if (body != null) ARCHIVE_RECHECK else ARCHIVE_RETRY)
+        val retryAt = now + if (article != null) ARCHIVE_RECHECK else ARCHIVE_RETRY
+        return store.saveArchive(candidate, article?.body, retryAt, article?.format)
     }
 
     private fun indexVectors(model: BekkoEmbedding, limit: Int) {

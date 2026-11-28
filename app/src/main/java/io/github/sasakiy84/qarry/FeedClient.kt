@@ -168,7 +168,7 @@ class FeedClient(
         }
     }
 
-    internal fun articleText(url: String): String? {
+    internal fun articleText(url: String): ArchivedArticleText? {
         val address = httpsUrl(url) ?: return null
         val page = fetch(address, archiveArticle = true)
         return if (page.archiveAllowed) extractArticleText(page.parseHtml()) else null
@@ -444,7 +444,7 @@ fun parseFeed(bytes: ByteArray, url: String, charset: String? = null): FeedDocum
             val stableKey = externalId ?: entryLink ?: "$title\u0000${dateText ?: body}"
             FeedArticle(
                 key = MessageDigest.getInstance("SHA-256").digest(stableKey.toByteArray()).toHexString(),
-                title = title.ifEmpty { "無題の記事" }.take(500),
+                title = title.ifEmpty { UNTITLED_ARTICLE }.take(500),
                 url = entryLink,
                 body = body,
                 published = feedDate(dateText),

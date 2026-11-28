@@ -207,12 +207,15 @@ private fun ArticleCardContent(
     onDismiss: ((ArticleRating?) -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
-    val metadata = rememberArticleMetadata(article.url)
-    val image = rememberArticleImage(metadata?.imageUrl, article.thumbnailUrl)
+    val feedArticleTitle = article.title?.takeIf { it.isNotBlank() && it != UNTITLED_ARTICLE }
+    val feedDescription = article.body?.trim()?.takeIf(String::isNotEmpty)
+    val metadata = rememberArticleMetadata(article.url, fetchIfMissing = feedArticleTitle == null || feedDescription == null)
+    val image = rememberArticleImage(article.thumbnailUrl, metadata?.imageUrl)
     val typography = MaterialTheme.typography
     val largeText = LocalDensity.current.fontScale >= 1.5f
-    val title = metadata?.title ?: article.displayTitle
-    val titleLines = if (largeText) 2 else 1
+    val title = feedArticleTitle ?: metadata?.title ?: article.displayTitle
+    val hasSourceTimestamp = article.updatedAt != null || article.publishedTime != null
+    val date = article.timestampLabel(metadata.takeUnless { hasSourceTimestamp })
     Column(
         modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceContainer)
             .articleOpenActions(article.url, onOpen)
@@ -232,7 +235,7 @@ private fun ArticleCardContent(
         Text(
             title, style = typography.titleSmall.copy(lineBreak = LineBreak.Heading),
             fontWeight = if (article.read) FontWeight.Medium else FontWeight.SemiBold,
-            minLines = titleLines, maxLines = titleLines, overflow = TextOverflow.Ellipsis,
+            maxLines = 2, overflow = TextOverflow.Ellipsis,
         )
         Row(
             Modifier.fillMaxWidth(),
@@ -240,7 +243,6 @@ private fun ArticleCardContent(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                val date = article.timestampLabel(metadata)
                 if (largeText) {
                     Text(
                         date.orEmpty(), style = typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -272,7 +274,7 @@ private fun ArticleCardContent(
                     }
                 }
                 Text(
-                    (metadata?.description ?: article.body).orEmpty().trim(),
+                    (feedDescription ?: metadata?.description).orEmpty(),
                     style = typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                     minLines = 2, maxLines = 2, overflow = TextOverflow.Ellipsis,
                 )

@@ -176,8 +176,8 @@ internal fun QarryScreen(
 
     fun openQueue(id: Long) = navigateTo(DetailRoute(DetailKind.Queue, id))
 
-    fun openLink(address: String): Boolean {
-        val safeUrl = webUrl(address) ?: return false
+    fun openLink(address: String, articleBody: Boolean = false): Boolean {
+        val safeUrl = (if (articleBody) archivedLinkUrl(address) else webUrl(address)) ?: return false
         try {
             context.startActivity(Intent(Intent.ACTION_VIEW, safeUrl.toUri()))
             return true
@@ -391,7 +391,8 @@ internal fun QarryScreen(
                                     }
                                 },
                                 onShare = ::shareArticle,
-                                onFetchFullText = if (opened.archivedBody == null && httpsUrl(opened.url) != null) ({
+                                onBodyLink = { openLink(it, articleBody = true) },
+                                onFetchFullText = if (opened.archivedFormat == null && httpsUrl(opened.url) != null) ({
                                     if (archivingArticle == null) {
                                         archivingArticle = opened.id
                                         change {

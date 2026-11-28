@@ -752,6 +752,23 @@ class FeedStoreTest {
     }
 
     @Test
+    fun upgradingVersionTwelveKeepsLegacyArchivedBodyReadable() {
+        val feed = store.subscribe(example, null)
+        val article = store.feedArticles(feed, 10).articles.single()
+        val candidate = ArchiveCandidate(article.id, checkNotNull(article.url))
+        assertTrue(store.saveArchive(candidate, "保存済みの本文", Long.MAX_VALUE))
+
+        reopenFromVersion(12)
+
+        val restored = checkNotNull(store.article(article.id))
+        assertEquals(listOf(ArchivedParagraph("保存済みの本文")), archivedParagraphs(checkNotNull(restored.archivedBody), restored.archivedFormat))
+        assertNull(restored.archivedFormat)
+        assertTrue(store.saveArchive(candidate, "保存済みの本文", Long.MAX_VALUE, """{"0":[2,[]]}"""))
+        assertFalse(store.saveArchive(candidate, null, Long.MAX_VALUE))
+        assertEquals("""{"0":[2,[]]}""", store.article(article.id)?.archivedFormat)
+    }
+
+    @Test
     fun collectsOnlyNewVisibleArticlesAfterTheInitialRefresh() {
         val feedId = store.importSubscriptions(OpmlContents(listOf(
             OpmlFeed(example.url, example.title, notifications = FeedNotificationMode.On),
@@ -774,8 +791,10 @@ class FeedStoreTest {
 
     private fun reopenFromVersion(version: Int, removeNewerSchema: SQLiteDatabase.() -> Unit = {}) {
         store.writableDatabase.apply {
-            execSQL("DROP TABLE quote_feedback")
-            execSQL("DROP TABLE quote_model")
+            if (version < 12) {
+                execSQL("DROP TABLE quote_feedback")
+                execSQL("DROP TABLE quote_model")
+            }
             if (version < 11) execSQL("ALTER TABLE feed DROP COLUMN notifications")
             if (version < 10) {
                 execSQL("DROP TRIGGER article_search_update")
@@ -784,6 +803,8 @@ class FeedStoreTest {
                 execSQL("DROP TABLE article_fts")
                 execSQL("DROP TABLE article_archive")
                 execSQL("DROP TABLE search_options")
+            } else if (version < 13) {
+                execSQL("ALTER TABLE article_archive DROP COLUMN formatting")
             }
             if (version < 9) {
                 execSQL("DROP TABLE article_action")

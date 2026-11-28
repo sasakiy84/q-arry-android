@@ -22,8 +22,13 @@ import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.LinkAnnotation
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextLinkStyles
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import java.time.Instant
@@ -208,14 +213,15 @@ internal fun ArticlePage(
     onFetchFullText: (() -> Unit)? = null,
     fetchingFullText: Boolean = false,
     quoteLearning: QuoteLearning? = null,
+    onBodyLink: (String) -> Unit = {},
 ) {
     val metadata = rememberArticleMetadata(article.url)
     val image = rememberArticleImage(metadata?.imageUrl, article.thumbnailUrl)
     val title = metadata?.title ?: article.displayTitle
     val articleUrl = article.url?.takeIf { webUrl(it) != null }
     val canRate = !article.dismissed || (article.originalOpenedAt != null && article.rating == null)
-    val paragraphs = remember(article.archivedBody) {
-        article.archivedBody?.split("\n\n")?.flatMap { it.chunked(3500) }
+    val paragraphs = remember(article.archivedBody, article.archivedFormat) {
+        article.archivedBody?.let { archivedParagraphs(it, article.archivedFormat) }
     }
     LazyColumn(modifier, contentPadding = pagePadding, verticalArrangement = Arrangement.spacedBy(18.dp)) {
         item {
@@ -245,6 +251,11 @@ internal fun ArticlePage(
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onClick = { onOpen(url) }) { Text("元記事") }
                     OutlinedButton(onClick = { onShare(title, url) }) { Text("共有") }
+                    if (paragraphs != null && onFetchFullText != null) {
+                        TextButton(onClick = onFetchFullText, enabled = !fetchingFullText) {
+                            Text(if (fetchingFullText) "全文を取得中" else "全文を再取得")
+                        }
+                    }
                 }
             }
         }
@@ -253,7 +264,7 @@ internal fun ArticlePage(
         }
         if (paragraphs != null) {
             items(paragraphs) { paragraph ->
-                SelectionContainer { Text(paragraph, style = MaterialTheme.typography.bodyLarge) }
+                ArchivedBodyParagraph(paragraph, onBodyLink)
             }
         } else {
             item {
@@ -314,6 +325,38 @@ internal fun ArticlePage(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun ArchivedBodyParagraph(paragraph: ArchivedParagraph, onLink: (String) -> Unit) {
+    val openLink by rememberUpdatedState(onLink)
+    val primary = MaterialTheme.colorScheme.primary
+    val text = remember(paragraph, primary) {
+        buildAnnotatedString {
+            append(paragraph.text)
+            val styles = TextLinkStyles(style = SpanStyle(color = primary, textDecoration = TextDecoration.Underline))
+            for (link in paragraph.links) {
+                addLink(LinkAnnotation.Url(link.url, styles) { openLink(link.url) }, link.start, link.end)
+            }
+        }
+    }
+    val typography = MaterialTheme.typography
+    val style = when (paragraph.headingLevel) {
+        0 -> typography.bodyLarge
+        1 -> typography.headlineSmall
+        2 -> typography.titleLarge
+        3 -> typography.titleMedium
+        else -> typography.titleSmall
+    }
+    val isHeading = paragraph.headingLevel > 0
+    SelectionContainer {
+        Text(
+            text,
+            modifier = if (isHeading) Modifier.semantics { heading() } else Modifier,
+            style = style,
+            fontWeight = FontWeight.SemiBold.takeIf { isHeading },
+        )
     }
 }
 

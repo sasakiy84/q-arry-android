@@ -26,6 +26,8 @@ import java.net.URI
 internal data class BackgroundUpdateSettings(
     val feedWifiOnly: Boolean = false,
     val archiveUnmeteredOnly: Boolean = true,
+    val feedOnOpenOnly: Boolean = false,
+    val archiveChargingOnly: Boolean = true,
 ) {
     fun networkRequest(jobId: Int): NetworkRequest = NetworkRequest.Builder()
         .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
@@ -47,12 +49,16 @@ internal class BackgroundUpdates(private val context: Context) {
         get() = BackgroundUpdateSettings(
             feedWifiOnly = preferences.getBoolean("feed_wifi_only", false),
             archiveUnmeteredOnly = preferences.getBoolean("archive_unmetered_only", true),
+            feedOnOpenOnly = preferences.getBoolean("feed_on_open_only", false),
+            archiveChargingOnly = preferences.getBoolean("archive_charging_only", true),
         )
 
     fun update(settings: BackgroundUpdateSettings) {
         preferences.edit {
             putBoolean("feed_wifi_only", settings.feedWifiOnly)
             putBoolean("archive_unmetered_only", settings.archiveUnmeteredOnly)
+            putBoolean("feed_on_open_only", settings.feedOnOpenOnly)
+            putBoolean("archive_charging_only", settings.archiveChargingOnly)
         }
         schedule()
     }
@@ -61,10 +67,15 @@ internal class BackgroundUpdates(private val context: Context) {
         val current = settings
         val service = ComponentName(context, FeedRefreshService::class.java)
         for (id in listOf(FEED_REFRESH_JOB, FULL_TEXT_JOB)) {
+            if (id == FEED_REFRESH_JOB && current.feedOnOpenOnly) {
+                scheduler.cancel(id)
+                continue
+            }
             val job = JobInfo.Builder(id, service)
                 .setRequiredNetwork(current.networkRequest(id))
                 .setRequiresBatteryNotLow(true)
-                .setPeriodic(60 * 60 * 1_000L)
+                .setRequiresCharging(id == FULL_TEXT_JOB && current.archiveChargingOnly)
+                .setPeriodic(if (id == FEED_REFRESH_JOB) 12 * HOUR_MS else HOUR_MS)
                 .setPersisted(true)
                 .build()
             if (scheduler.getPendingJob(id) == job) continue
@@ -74,14 +85,27 @@ internal class BackgroundUpdates(private val context: Context) {
         }
     }
 
-    fun clientFor(jobId: Int, network: Network): FeedClient? {
-        fun allowed(): Boolean =
-            settings.networkRequest(jobId).canBeSatisfiedBy(connectivity.getNetworkCapabilities(network))
+    fun claimOpenRefresh(now: Long = System.currentTimeMillis()): FeedClient? {
+        if (!settings.feedOnOpenOnly) return null
+        val lastAttempt = preferences.getLong("last_open_refresh_attempt", 0L)
+        if (lastAttempt > 0 && now - lastAttempt in 0L until OPEN_REFRESH_GAP_MS) return null
+        val network = connectivity.activeNetwork ?: return null
+        val client = clientFor(FEED_REFRESH_JOB, network, fromOpen = true) ?: return null
+        preferences.edit { putLong("last_open_refresh_attempt", now) }
+        return client
+    }
+
+    fun clientFor(jobId: Int, network: Network, fromOpen: Boolean = false): FeedClient? {
+        fun allowed(): Boolean {
+            val current = settings
+            if (jobId == FEED_REFRESH_JOB && current.feedOnOpenOnly != fromOpen) return false
+            return current.networkRequest(jobId).canBeSatisfiedBy(connectivity.getNetworkCapabilities(network))
+        }
 
         if (!allowed()) return null
         return FeedClient { url ->
             // The default network can be cellular even when the job was scheduled on Wi-Fi.
-            if (!allowed()) throw CancellationException("Background network no longer meets the requested constraints")
+            if (!allowed()) throw CancellationException("Automatic update no longer meets the requested conditions")
             network.openConnection(URI(url).toURL()) as HttpURLConnection
         }
     }
@@ -133,4 +157,6 @@ class FeedRefreshService : JobService() {
 
 internal const val FEED_REFRESH_JOB = 241
 internal const val FULL_TEXT_JOB = 242
+private const val HOUR_MS = 60 * 60 * 1_000L
+private const val OPEN_REFRESH_GAP_MS = HOUR_MS / 2
 private const val BACKGROUND_LOG = "QarryBackground"
