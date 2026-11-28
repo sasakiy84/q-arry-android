@@ -15,6 +15,26 @@ import org.robolectric.annotation.SQLiteMode
 @SQLiteMode(SQLiteMode.Mode.NATIVE)
 class ArticleArchiveTest {
     @Test
+    fun automaticArchiveIndexesOneBatchAndSearchCanFinishTheBacklog() = runBlocking {
+        val context = RuntimeEnvironment.getApplication()
+        context.deleteDatabase("q-arry.db")
+        FeedStore(context).use { store ->
+            val client = FeedClient { error("These entries have no downloadable article URLs") }
+            val archive = ArticleArchive(store, client, null)
+            store.subscribe(
+                FeedDocument("https://publisher.example/feed", "研究", null, (1..55).map {
+                    FeedArticle("entry-$it", "探査報告 $it", null, null, null)
+                }), null,
+            )
+
+            assertEquals(0, archive.fetchPending(completeLexicalIndex = false))
+            assertEquals(40L, archive.stats().indexed)
+            assertEquals(55, archive.search("探査", 60).listing.articles.size)
+            assertEquals(55L, archive.stats().indexed)
+        }
+    }
+
+    @Test
     fun archivesTheBodyAndSearchesJapaneseEvenAfterTheArticleLeavesTheQueues() = runBlocking {
         val url = "https://publisher.example/article"
         val html = """

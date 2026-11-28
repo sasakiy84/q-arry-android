@@ -2,6 +2,7 @@ package io.github.sasakiy84.qarry
 
 import org.junit.Assert.*
 import org.junit.Test
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.InetAddress
 import java.net.ServerSocket
@@ -12,6 +13,43 @@ import java.time.Instant
 import kotlin.concurrent.thread
 
 class FeedClientTest {
+    @Test
+    fun interruptionStopsAnInProgressResponseAndReleasesTheConnection() {
+        var reads = 0
+        var streamClosed = false
+        var disconnected = false
+        val client = FeedClient { url ->
+            object : HttpURLConnection(URI(url).toURL()) {
+                override fun connect(): Unit = Unit
+                override fun disconnect() { disconnected = true }
+                override fun usingProxy(): Boolean = false
+                override fun getResponseCode(): Int = HTTP_OK
+                override fun getInputStream(): InputStream = object : InputStream() {
+                    override fun read(): Int = error("The response must be read in chunks")
+                    override fun read(bytes: ByteArray, offset: Int, length: Int): Int {
+                        reads++
+                        if (reads > 1) return -1
+                        Thread.currentThread().interrupt()
+                        bytes[offset] = 60
+                        return 1
+                    }
+                    override fun close() { streamClosed = true }
+                }
+            }
+        }
+
+        try {
+            assertThrows(InterruptedException::class.java) {
+                client.refresh("https://publisher.example/feed", null, null)
+            }
+        } finally {
+            Thread.interrupted()
+        }
+        assertEquals(1, reads)
+        assertTrue(streamClosed)
+        assertTrue(disconnected)
+    }
+
     @Test
     fun rssAcceptsJapaneseAndHtmlPreservesStableKeysAndDropsDuplicateGuids() {
         val xml = """

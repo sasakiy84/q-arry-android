@@ -21,6 +21,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.launch
 import java.io.IOException
 
@@ -38,7 +39,7 @@ internal fun ArticleSearchPage(
     var result by remember { mutableStateOf<ArticleSearchResult?>(null) }
     var loadedLimit by remember { mutableIntStateOf(0) }
     var failed by remember { mutableStateOf(false) }
-    val archiveRevision by archive.revision.collectAsState()
+    val archiveRevision by archive.revision.collectAsStateWithLifecycle()
     val focus = LocalFocusManager.current
     fun submit() {
         focus.clearFocus()
@@ -117,7 +118,7 @@ internal fun ArticleSearchPage(
 internal fun ArticleSearchSettings(archive: ArticleArchive, libraryRevision: Int) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val archiveRevision by archive.revision.collectAsState()
+    val archiveRevision by archive.revision.collectAsStateWithLifecycle()
     var stats by remember { mutableStateOf<SearchStats?>(null) }
     var progress by remember { mutableStateOf<String?>(null) }
     val working = progress != null

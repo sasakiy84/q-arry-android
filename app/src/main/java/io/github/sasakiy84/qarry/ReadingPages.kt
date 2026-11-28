@@ -8,12 +8,14 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
@@ -68,6 +70,8 @@ internal fun SettingsPage(
                 HorizontalDivider(Modifier.padding(horizontal = 20.dp))
                 DefaultNotificationSettings(notificationSettings)
                 HorizontalDivider(Modifier.padding(horizontal = 20.dp))
+                BackgroundUpdateOptions()
+                HorizontalDivider(Modifier.padding(horizontal = 20.dp))
                 FeedTransferSettings(transfer)
                 HorizontalDivider(Modifier.padding(horizontal = 20.dp))
                 QuoteSettings(quoteEnabled, onQuoteEnabled, onQuoteTraining)
@@ -112,6 +116,35 @@ internal fun SettingsPage(
             }
         }
     }
+}
+
+@Composable
+private fun BackgroundUpdateOptions() {
+    val updates = (LocalContext.current.applicationContext as QarryApplication).backgroundUpdates
+    var settings by remember(updates) { mutableStateOf(updates.settings) }
+    Column(Modifier.padding(vertical = 12.dp)) {
+        Text(
+            "バックグラウンド通信", Modifier.padding(horizontal = 20.dp).semantics { heading() },
+            style = MaterialTheme.typography.titleMedium,
+        )
+        BackgroundUpdateSwitch("フィードの自動更新は Wi-Fi のみ", settings.feedWifiOnly) { checked ->
+            settings = settings.copy(feedWifiOnly = checked)
+            updates.update(settings)
+        }
+        BackgroundUpdateSwitch("自動全文取得は非従量制回線のみ", settings.archiveUnmeteredOnly) { checked ->
+            settings = settings.copy(archiveUnmeteredOnly = checked)
+            updates.update(settings)
+        }
+    }
+}
+
+@Composable
+private fun BackgroundUpdateSwitch(label: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
+    ListItem(
+        headlineContent = { Text(label) },
+        trailingContent = { Switch(checked = checked, onCheckedChange = null) },
+        modifier = Modifier.toggleable(checked, role = Role.Switch, onValueChange = onCheckedChange),
+    )
 }
 
 @Composable

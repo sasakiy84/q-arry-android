@@ -24,6 +24,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.core.net.toUri
 import androidx.core.content.edit
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -88,9 +89,9 @@ internal fun QarryScreen(
     var pendingArticleView by remember { mutableStateOf<Job?>(null) }
     var ratings by remember { mutableStateOf<RatingListing?>(null) }
     val dialogs = rememberLibraryDialogState()
-    val revision by library.revision.collectAsState()
-    val archiveRevision by library.archive.revision.collectAsState()
-    val refreshing by library.refreshing.collectAsState()
+    val revision by library.revision.collectAsStateWithLifecycle()
+    val archiveRevision by library.archive.revision.collectAsStateWithLifecycle()
+    val refreshing by library.refreshing.collectAsStateWithLifecycle()
     val snackbars = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current

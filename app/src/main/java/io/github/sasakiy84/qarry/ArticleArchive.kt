@@ -22,18 +22,18 @@ internal class ArticleArchive(private val store: FeedStore, private val client: 
     suspend fun fetchArticle(article: Article): Boolean {
         val url = article.url ?: return false
         val candidate = ArchiveCandidate(article.id, url)
-        val saved = downloads.withLock { runInterruptible(Dispatchers.IO) { fetch(candidate) } }
+        val saved = downloads.withLock { runInterruptible(Dispatchers.IO) { fetch(candidate, client) } }
         changes.update { it + 1 }
         return saved
     }
 
-    suspend fun fetchPending(): Int {
+    suspend fun fetchPending(requestClient: FeedClient = client, completeLexicalIndex: Boolean = true): Int {
         val saved = downloads.withLock {
             runInterruptible(Dispatchers.IO) {
-                store.archiveCandidates(System.currentTimeMillis(), 20).count(::fetch)
+                store.archiveCandidates(System.currentTimeMillis(), 20).count { fetch(it, requestClient) }
             }
         }
-        syncLexicalIndex()
+        syncLexicalIndex(completeLexicalIndex)
         semanticLock.withLock {
             runInterruptible(Dispatchers.IO) {
                 if (store.semanticEnabled() && embedding != null) {
@@ -89,17 +89,20 @@ internal class ArticleArchive(private val store: FeedStore, private val client: 
         return ArticleSearchResult(ArticleListing(articles, order.size > limit), unavailable)
     }
 
-    private suspend fun syncLexicalIndex() {
-        while (runInterruptible(Dispatchers.IO) { store.indexArticles(40) } == 40) Unit
+    private suspend fun syncLexicalIndex(complete: Boolean = true) {
+        do {
+            val indexed = runInterruptible(Dispatchers.IO) { store.indexArticles(LEXICAL_BATCH_SIZE) }
+        } while (complete && indexed == LEXICAL_BATCH_SIZE)
     }
 
-    private fun fetch(candidate: ArchiveCandidate): Boolean {
+    private fun fetch(candidate: ArchiveCandidate, requestClient: FeedClient): Boolean {
         val body = try {
-            client.articleText(candidate.url)
+            requestClient.articleText(candidate.url)
         } catch (_: IOException) {
             if (Thread.currentThread().isInterrupted) throw InterruptedException()
             null
         }
+        if (Thread.currentThread().isInterrupted) throw InterruptedException()
         val now = System.currentTimeMillis()
         return store.saveArchive(candidate, body, now + if (body != null) ARCHIVE_RECHECK else ARCHIVE_RETRY)
     }
@@ -115,3 +118,4 @@ internal class ArticleArchive(private val store: FeedStore, private val client: 
 
 private const val ARCHIVE_RETRY = 24 * 60 * 60 * 1000L
 private const val ARCHIVE_RECHECK = 30 * ARCHIVE_RETRY
+private const val LEXICAL_BATCH_SIZE = 40

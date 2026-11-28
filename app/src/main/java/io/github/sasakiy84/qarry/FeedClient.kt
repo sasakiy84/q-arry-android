@@ -6,7 +6,9 @@ import org.jsoup.nodes.Element
 import org.jsoup.nodes.TextNode
 import org.jsoup.parser.Parser
 import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.SocketTimeoutException
 import java.net.URI
@@ -247,6 +249,7 @@ class FeedClient(
         var conditional = true
         val addresses = mutableSetOf<String>()
         repeat(6) {
+            if (Thread.currentThread().isInterrupted) throw InterruptedException()
             if (!addresses.add(address)) throw FeedRequestException("転送がループしています。")
             if (!address.startsWith("https://")) {
                 throw FeedRequestException("サイトに接続するにはHTTPSのURLが必要です。")
@@ -300,7 +303,7 @@ class FeedClient(
                             archiveArticle -> MAX_ARCHIVE_PAGE_BYTES + 1
                             else -> MAX_FEED_BYTES + 1
                         }
-                        val bytes = connection.inputStream.use { it.readNBytes(limit) }
+                        val bytes = connection.inputStream.use { it.readResponseBytes(limit) }
                         if (bytes.size > (if (archiveArticle) MAX_ARCHIVE_PAGE_BYTES else MAX_FEED_BYTES)) {
                             throw FeedRequestException("取得したデータが大きすぎます。")
                         }
@@ -325,6 +328,19 @@ class FeedClient(
         }
         throw FeedRequestException("URLの転送回数が多すぎます。")
     }
+}
+
+private fun InputStream.readResponseBytes(limit: Int): ByteArray {
+    val buffer = ByteArray(8 * 1024)
+    val output = ByteArrayOutputStream(buffer.size)
+    while (output.size() < limit) {
+        if (Thread.currentThread().isInterrupted) throw InterruptedException()
+        val count = read(buffer, 0, minOf(buffer.size, limit - output.size()))
+        if (count < 0) break
+        output.write(buffer, 0, count)
+    }
+    if (Thread.currentThread().isInterrupted) throw InterruptedException()
+    return output.toByteArray()
 }
 
 private data class FeedResponse(

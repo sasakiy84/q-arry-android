@@ -1,27 +1,17 @@
 package io.github.sasakiy84.qarry
 
 import android.app.Application
-import android.app.job.JobInfo
-import android.app.job.JobParameters
-import android.app.job.JobScheduler
-import android.app.job.JobService
-import android.content.ComponentName
 import android.content.Context
-import android.database.sqlite.SQLiteException
 import android.os.SystemClock
 import android.util.Log
 import android.util.LruCache
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
@@ -33,6 +23,8 @@ import java.io.InputStream
 import java.io.OutputStream
 
 class QarryApplication : Application() {
+    internal val backgroundUpdates by lazy { BackgroundUpdates(this) }
+
     val library: FeedLibrary by lazy {
         FeedLibrary(
             FeedStore(this).apply { setWriteAheadLoggingEnabled(true) }, FeedClient(),
@@ -42,49 +34,7 @@ class QarryApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
-        val scheduler = getSystemService(JobScheduler::class.java)
-        if (scheduler.getPendingJob(REFRESH_JOB) == null) {
-            val job = JobInfo.Builder(REFRESH_JOB, ComponentName(this, FeedRefreshService::class.java))
-                .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
-                .setPeriodic(60 * 60 * 1_000L)
-                .setPersisted(true)
-                .build()
-            val scheduled = scheduler.schedule(job) == JobScheduler.RESULT_SUCCESS
-            Log.i(FEED_LOG, "Periodic refresh scheduled=$scheduled")
-        }
-    }
-}
-
-class FeedRefreshService : JobService() {
-    private val scope = CoroutineScope(Dispatchers.Main)
-    private var refreshJob: Job? = null
-
-    override fun onStartJob(params: JobParameters): Boolean {
-        refreshJob = scope.launch {
-            var retry = false
-            try {
-                val library = (application as QarryApplication).library
-                library.refresh()
-                library.archive.fetchPending()
-            } catch (_: SQLiteException) {
-                Log.w(FEED_LOG, "Background refresh could not access the database")
-                retry = true
-            } finally {
-                if (refreshJob?.isCancelled == false) jobFinished(params, retry)
-            }
-        }
-        return true
-    }
-
-    override fun onStopJob(params: JobParameters): Boolean {
-        refreshJob?.cancel()
-        refreshJob = null
-        return true
-    }
-
-    override fun onDestroy() {
-        scope.cancel()
-        super.onDestroy()
+        backgroundUpdates.schedule()
     }
 }
 
@@ -193,10 +143,10 @@ class FeedLibrary(private val store: FeedStore, private val client: FeedClient, 
     suspend fun dismissFeedArticles(feedId: Long): Int = change { store.dismissFeedArticles(feedId) }
     internal suspend fun changeRating(key: RatingKey, rating: ArticleRating?): Unit = change { store.changeRating(key, rating) }
 
-    suspend fun refresh(onlyFeed: Long? = null) {
+    suspend fun refresh(onlyFeed: Long? = null, requestClient: FeedClient = client) {
         if (!refreshLock.tryLock()) return
         try {
-            refreshFeeds(onlyFeed?.let(::setOf))
+            refreshFeeds(onlyFeed?.let(::setOf), requestClient)
         } finally {
             refreshLock.unlock()
         }
@@ -204,10 +154,10 @@ class FeedLibrary(private val store: FeedStore, private val client: FeedClient, 
 
     internal suspend fun refreshImported(feedIds: Set<Long>) {
         if (feedIds.isEmpty()) return
-        refreshLock.withLock { refreshFeeds(feedIds) }
+        refreshLock.withLock { refreshFeeds(feedIds, client) }
     }
 
-    private suspend fun refreshFeeds(feedIds: Set<Long>?): Unit = coroutineScope {
+    private suspend fun refreshFeeds(feedIds: Set<Long>?, requestClient: FeedClient): Unit = coroutineScope {
         activeRefresh.value = true
         try {
             val feeds = runInterruptible(Dispatchers.IO) { store.subscriptions() }
@@ -221,9 +171,10 @@ class FeedLibrary(private val store: FeedStore, private val client: FeedClient, 
                                 val oldKeys = if (feed.htmlWatch == null && feed.htmlItemSelector?.contains(":nth-child(") == true) {
                                     store.recentWebsiteKeys(feed.id)
                                 } else emptySet()
-                                val document = client.refresh(
+                                val document = requestClient.refresh(
                                     feed.url, feed.etag, feed.modified, feed.htmlItemSelector, feed.htmlWatch, oldKeys,
                                 )
+                                if (Thread.currentThread().isInterrupted) throw InterruptedException()
                                 val notificationDefault = notifications?.takeIf { it.canPost() }?.defaultEnabled
                                 val result = store.recordRefresh(
                                     feed.id, document, expected = feed, notificationDefault = notificationDefault,
@@ -257,6 +208,5 @@ internal data class FeedImportResult(
 fun Context.feedLibrary(): FeedLibrary = (applicationContext as QarryApplication).library
 
 private const val FEED_LOG = "QarryFeeds"
-private const val REFRESH_JOB = 241
 private const val METADATA_LOOKUP_TTL = 30 * 60 * 1_000L
 private data class MetadataLookup(val metadata: ArticleMetadata?, val expiresAt: Long)

@@ -19,6 +19,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import java.io.IOException
@@ -45,7 +46,7 @@ internal fun QuoteSettings(enabled: Boolean, onEnabled: (Boolean) -> Unit, onTra
 
 @Composable
 internal fun ArticleLeadQuote(learning: QuoteLearning, source: QuoteSource, modifier: Modifier = Modifier) {
-    val revision by learning.revision.collectAsState()
+    val revision by learning.revision.collectAsStateWithLifecycle()
     var ranked by remember(source, revision) { mutableStateOf(emptyList<QuoteSpan>()) }
     LaunchedEffect(learning, source, revision) {
         ranked = try {
